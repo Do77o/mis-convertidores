@@ -1032,141 +1032,535 @@ async function parseProvincia(pdf, rules) {
 
 // ── BBVA ────────────────────────────────────────────────────
 async function parseBBVA(pdf, rules, fileName) {
-  const lines = await getPdfLines(pdf);
-  function normalizeSpaces(t){return(t||'').replace(/\s+/g,' ').trim();}
-  function isNoiseLine(t){return!t||/^Sobre\s*\(/i.test(t)||/^Banco BBVA Argentina/i.test(t)||/^[^A-Za-z0-9$U\/().\- ,:]+$/i.test(t)||/^\d+\/\d+\s+\d+\s+de\s+\d+/i.test(t)||/^\d+\s*-\s*\d+$/i.test(t);}
-  function isRealDetailAccountTitle(t){return/^(CUENTA CORRIENTE|CAJA DE AHORRO|PLAZOS FIJOS|INVERSIONES)(\s+EN\s+|\s+)(PESOS|DOLARES|USD|\$)/i.test(t);}
-  function cleanAccountTitle(t){return t.replace(/\s{2,}/g,' ').trim();}
-  function isStopSection(t){return/^(RESUMEN DE TARJETAS|INVERSIONES\/PLAZOS|OTROS SERVICIOS)/i.test(t);}
-  function shouldSkipDataLine(t){return!t||/^(FECHA|DESCRIPCION|SALDO|TOTAL)\b/i.test(t)||/^-{5,}/.test(t);}
-  function parseAmtBBVA(v){const m=String(v||'').match(/-?\d{1,3}(?:\.\d{3})*,\d{2}/);if(!m)return null;const n=Number(m[0].replace(/\./g,'').replace(',','.'));return Number.isFinite(n)?n:null;}
-  function getLastAmt(t){const ms=String(t||'').match(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g)||[];if(!ms.length)return null;return parseAmtBBVA(ms[ms.length-1]);}
+  // Fixed parser — mirrors the standalone BBVA converter v9 that works correctly.
+  // Key fixes vs broken version:
+  //   1. findDetailStart: looks for "Movimientos en cuentas" OR "DETALLE" (not "DETALLE DE CUENTAS")
+  //   2. isRealDetailAccountTitle: matches "CC $ 466-000649/7 (Cta.Cte.Bancaria)" pattern
+  //   3. isConsolidatedTitle: excludes the summary "incluida en el paquete" / "Saldo Consolidado" lines
+  //   4. isStopSection: correctly stops at "Transferencias", "Débitos automáticos", "Legales y avisos"
+  //   5. extractPageLines: uses X-range filter (35-575) and gap-based text joining like the v9
 
-  const byName=String(fileName||'').match(/\b(20\d{2})\b/);
-  let baseYear=byName?Number(byName[1]):new Date().getFullYear();
-  for(const l of lines){const m=l.match(/\b(20\d{2})\b/);if(m){baseYear=Number(m[1]);break;}}
+  function normalizeSpaces(t) { return (t || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim(); }
 
-  const cleanedLines=lines.map(normalizeSpaces).filter(t=>t&&!isNoiseLine(t));
-  const startIdx=cleanedLines.findIndex(l=>/^DETALLE\s+DE\s+CUENTAS/i.test(l));
-  if(startIdx===-1) return {sheets:[{name:'Movimientos',rows:[]}],meta:{}};
+  function isNoiseLine(t) {
+    return !t ||
+      /^Sobre\s*\(/i.test(t) ||
+      /^Banco BBVA Argentina/i.test(t) ||
+      /^[^A-Za-z0-9$U\/()\-\. ,:]+$/i.test(t) ||
+      /^\d+\/\d+\s+\d+\s+de\s+\d+/i.test(t) ||
+      /^\d+\s*-\s*\d+$/i.test(t);
+  }
 
-  const accounts=[];let current=null;
-  function pushCurrent(){if(current&&current.rows.length>0)accounts.push(current);current=null;}
+  function isAccountTitle(v) {
+    return /^CC\s*(?:U\$S|\$)\s*\d{3}-\d+\/\d+\s*\(Cta\.Cte\.Bancaria/i.test(v || '');
+  }
 
-  for(let i=startIdx;i<cleanedLines.length;i++){
-    const text=cleanedLines[i];
-    if(isStopSection(text)){pushCurrent();break;}
-    if(isRealDetailAccountTitle(text)){pushCurrent();current={title:cleanAccountTitle(text),rows:[],started:false,currentYear:baseYear,lastMonth:null};continue;}
-    if(!current) continue;
-    if(/^FECHA\b/i.test(text)){current.started=true;continue;}
-    if(!current.started||shouldSkipDataLine(text)) continue;
+  function isConsolidatedTitle(v) {
+    return /incluida\s+en\s+el\s+paquete/i.test(v || '') || /Saldo\s+Consolidado/i.test(v || '');
+  }
 
-    if(/^SALDO ANTERIOR\s+/i.test(text)){
-      const amt=getLastAmt(text);
-      if(amt!=null) current.rows.push({orden:null,fecha:'',mes:'',descripcion:'SALDO ANTERIOR',imputacion:'',origen:'',debito:'',credito:'',saldo:Math.abs(amt),control:'',diferencia:''});
+  function isRealDetailAccountTitle(v) {
+    return isAccountTitle(v) && !isConsolidatedTitle(v);
+  }
+
+  function cleanAccountTitle(t) {
+    const m = String(t || '').match(/^(CC\s*(?:U\$S|\$)\s*\d{3}-\d+\/\d+\s*\(Cta\.Cte\.Bancaria\))/i);
+    const cleaned = m ? m[1] : t;
+    return normalizeSpaces(cleaned)
+      .replace(/CC\s*\$/i, 'CC $ ')
+      .replace(/CC\s*U\$S/i, 'CC U$S ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function isStopSection(t) {
+    return /^Transferencias$/i.test(t) ||
+      /^D[eé]bitos\s+autom[aá]ticos$/i.test(t) ||
+      /^Legales\s+y\s+avisos$/i.test(t);
+  }
+
+  function shouldSkipDataLine(t) {
+    return /^FECHA\b/i.test(t) ||
+      /^SALDO AL /i.test(t) ||
+      /^TOTAL MOVIMIENTOS/i.test(t) ||
+      /^\(\*\)\s*Ver\s*Legales/i.test(t) ||
+      /^Impuesto a los d[eé]bitos/i.test(t) ||
+      /^Los totales reflejados/i.test(t) ||
+      /^TOTAL COBRADO/i.test(t) ||
+      /^TOTAL DEV\./i.test(t) ||
+      /^IMP\. NETO/i.test(t) ||
+      /^El credito de impuesto/i.test(t) ||
+      /^REGIMEN SISTEMA/i.test(t) ||
+      /^PERIODO\s+/i.test(t);
+  }
+
+  function parseAmtBBVA(v) {
+    const m = String(v || '').match(/-?\d{1,3}(?:\.\d{3})*,\d{2}/);
+    if (!m) return null;
+    const n = Number(m[0].replace(/\./g, '').replace(',', '.'));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function getLastAmt(t) {
+    const ms = String(t || '').match(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g) || [];
+    if (!ms.length) return null;
+    return parseAmtBBVA(ms[ms.length - 1]);
+  }
+
+  // ── Extract page lines with X-range filter and gap-based joining (same as v9) ──
+  async function extractPageLines(page) {
+    const viewport = page.getViewport({ scale: 1 });
+    const content = await page.getTextContent({ normalizeWhitespace: true });
+    const usable = content.items
+      .filter(it => it.str && it.str.trim())
+      .map(it => {
+        const t = it.transform || [];
+        const x = Number(t[4] || 0);
+        const y = viewport.height - Number(t[5] || 0);
+        const b = Number(t[1] || 0);
+        const c = Number(t[2] || 0);
+        return { text: it.str, x, y, width: Number(it.width || 0), rotated: Math.abs(b) > 0.1 || Math.abs(c) > 0.1 };
+      })
+      .filter(it => !it.rotated)
+      .filter(it => it.x >= 35 && it.x <= 575);
+
+    usable.sort((a, b) => Math.abs(a.y - b.y) > 2.5 ? a.y - b.y : a.x - b.x);
+
+    const rows = [];
+    for (const it of usable) {
+      const last = rows[rows.length - 1];
+      if (!last || Math.abs(it.y - last.y) > 3) rows.push({ y: it.y, items: [it] });
+      else last.items.push(it);
+    }
+
+    for (const row of rows) {
+      row.items.sort((a, b) => a.x - b.x);
+      let text = '', prevRight = null;
+      for (const it of row.items) {
+        if (prevRight != null && it.x - prevRight > 1.8) text += ' ';
+        text += it.text;
+        prevRight = it.x + it.width;
+      }
+      row.text = text.replace(/\u00a0/g, ' ');
+    }
+    return rows;
+  }
+
+  function hasHeaderAhead(lines, index, distance) {
+    const max = Math.min(lines.length - 1, index + distance);
+    for (let i = index + 1; i <= max; i++) {
+      if (/^FECHA\b/i.test(lines[i])) return true;
+    }
+    return false;
+  }
+
+  function findDetailStart(lines) {
+    // Primary: "Movimientos en cuentas"
+    for (let i = 0; i < lines.length; i++) {
+      if (/^Movimientos en cuentas$/i.test(lines[i])) return i + 1;
+    }
+    // Fallback: "DETALLE"
+    for (let i = 0; i < lines.length; i++) {
+      if (/^DETALLE$/i.test(lines[i])) return i + 1;
+    }
+    // Last resort: first real account title that has a FECHA header nearby
+    for (let i = 0; i < lines.length; i++) {
+      if (isRealDetailAccountTitle(lines[i]) && hasHeaderAhead(lines, i, 8)) return i;
+    }
+    return -1;
+  }
+
+  function parseMovementLine(text, account, rules) {
+    if (/^SALDO ANTERIOR\s*/i.test(text)) {
+      const amt = getLastAmt(text);
+      return amt == null ? null : {
+        orden: null, fecha: '', mes: '',
+        descripcion: 'SALDO ANTERIOR', imputacion: '', origen: '',
+        debito: '', credito: '', saldo: r2(Math.abs(amt)), control: '', diferencia: ''
+      };
+    }
+
+    if (/^00\/00\s+SIN MOVIMIENTOS/i.test(text)) {
+      const amt = getLastAmt(text);
+      return amt == null ? null : {
+        orden: null, fecha: '', mes: '',
+        descripcion: 'SIN MOVIMIENTOS', imputacion: '', origen: '',
+        debito: '', credito: '', saldo: r2(Math.abs(amt)), control: '', diferencia: ''
+      };
+    }
+
+    const rowM = text.match(/^(\d{2}\/\d{2})\s+(.+)$/);
+    if (!rowM) return null;
+
+    const ddmm = rowM[1];
+    const rest = rowM[2];
+    const numbers = rest.match(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g) || [];
+    if (numbers.length < 2) return null;
+
+    const movTxt   = numbers[numbers.length - 2];
+    const saldoTxt = numbers[numbers.length - 1];
+    let desc = normalizeSpaces(rest.slice(0, rest.lastIndexOf(movTxt)))
+      .replace(/^(?:D|C)(?:\s+\d+)?\s+/i, '').trim();
+    if (!desc) desc = 'SIN DESCRIPCIÓN';
+
+    const month = Number(ddmm.split('/')[1]);
+    if (account.lastMonth != null && month < account.lastMonth - 6) account.currentYear += 1;
+    account.lastMonth = month;
+
+    const yy  = String(account.currentYear).slice(-2);
+    const amt  = parseAmtBBVA(movTxt);
+    const saldo = parseAmtBBVA(saldoTxt);
+    if (amt == null || saldo == null) return null;
+
+    return {
+      orden: null,
+      fecha: `${ddmm}/${yy}`,
+      mes: month >= 1 && month <= 12 ? `${MONTHS[month - 1]}-${yy}` : '',
+      descripcion: desc,
+      imputacion: classify(desc, rules),
+      origen: '',
+      debito:  movTxt.includes('-') ? r2(Math.abs(amt)) : '',
+      credito: movTxt.includes('-') ? '' : r2(Math.abs(amt)),
+      saldo: r2(Math.abs(saldo)),
+      control: '',
+      diferencia: ''
+    };
+  }
+
+  // ── Detect year ──
+  const byName = String(fileName || '').match(/\b(20\d{2})\b/);
+  let baseYear = byName ? Number(byName[1]) : new Date().getFullYear();
+
+  // ── Gather all lines from all pages ──
+  const allLines = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const pageLines = await extractPageLines(await pdf.getPage(p));
+    allLines.push(...pageLines);
+  }
+
+  const lines = allLines
+    .map(l => normalizeSpaces(l.text))
+    .filter(t => t && !isNoiseLine(t));
+
+  // Try to detect year from content if not in filename
+  if (!byName) {
+    for (const l of lines) { const m = l.match(/\b(20\d{2})\b/); if (m) { baseYear = Number(m[1]); break; } }
+  }
+
+  const startIdx = findDetailStart(lines);
+  if (startIdx === -1) return { sheets: [{ name: 'Movimientos', rows: [] }], meta: {} };
+
+  const accounts = [];
+  let current = null;
+
+  function pushCurrent() {
+    if (current && current.rows.length > 0) accounts.push(current);
+    current = null;
+  }
+
+  for (let i = startIdx; i < lines.length; i++) {
+    const text = lines[i];
+
+    if (isStopSection(text)) { pushCurrent(); break; }
+
+    if (isRealDetailAccountTitle(text)) {
+      pushCurrent();
+      current = { title: cleanAccountTitle(text), rows: [], startedTable: false, currentYear: baseYear, lastMonth: null };
       continue;
     }
-    const rowM=text.match(/^(\d{2}\/\d{2})\s+(.+)$/);
-    if(!rowM) continue;
-    const ddmm=rowM[1],rest=rowM[2];
-    const numbers=rest.match(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g)||[];
-    if(numbers.length<2) continue;
-    const movTxt=numbers[numbers.length-2],saldoTxt=numbers[numbers.length-1];
-    let desc=normalizeSpaces(rest.slice(0,rest.lastIndexOf(movTxt))).replace(/^(?:D|C)(?:\s+\d+)?\s+/i,'').trim();
-    if(!desc) desc='SIN DESCRIPCIÓN';
-    const month=Number(ddmm.split('/')[1]);
-    if(current.lastMonth!=null&&month<current.lastMonth-6) current.currentYear+=1;
-    current.lastMonth=month;
-    const yy=String(current.currentYear).slice(-2);
-    const amt=parseAmtBBVA(movTxt),saldo=parseAmtBBVA(saldoTxt);
-    if(amt==null||saldo==null) continue;
-    current.rows.push({orden:null,fecha:`${ddmm}/${yy}`,mes:month>=1&&month<=12?`${MONTHS[month-1]}-${yy}`:'',descripcion:desc,imputacion:classify(desc,rules),origen:'',
-      debito:movTxt.includes('-')?r2(Math.abs(amt)):'',credito:movTxt.includes('-')?'':r2(Math.abs(amt)),saldo:r2(Math.abs(saldo)),control:0,diferencia:0});
+
+    if (!current) continue;
+    if (/^FECHA\b/i.test(text)) { current.startedTable = true; continue; }
+    if (!current.startedTable) continue;
+    if (shouldSkipDataLine(text)) continue;
+
+    const row = parseMovementLine(text, current, rules);
+    if (row) current.rows.push(row);
   }
   pushCurrent();
 
-  const sheets=accounts.map(acc=>{
-    let order=1,saldoAnterior=null;
-    const rows=acc.rows.map(row=>{
-      const isSA=row.descripcion==='SALDO ANTERIOR';
-      const d=row.debito===''?'':Number(row.debito),c=row.credito===''?'':Number(row.credito),s=row.saldo===''?'':Number(row.saldo);
-      let ctrl='',dif='';
-      if(isSA){saldoAnterior=s===''?null:Number(s);}
-      else if(saldoAnterior!=null&&s!==''){ctrl=r2(saldoAnterior+(c===''?0:c)-(d===''?0:d));dif=r2(s-ctrl);saldoAnterior=s;}
-      return{...row,orden:isSA?'':order++,debito:d,credito:c,saldo:s,control:ctrl,diferencia:dif};
+  // Build sheets with control/diferencia
+  const sheets = accounts.map(acc => {
+    let order = 1, saldoAnterior = null;
+    const rows = acc.rows.map(row => {
+      const isSA = row.descripcion === 'SALDO ANTERIOR';
+      const d = row.debito  === '' ? '' : Number(row.debito);
+      const c = row.credito === '' ? '' : Number(row.credito);
+      const s = row.saldo   === '' ? '' : Number(row.saldo);
+      let ctrl = '', dif = '';
+      if (isSA) {
+        saldoAnterior = s === '' ? null : Number(s);
+      } else if (saldoAnterior != null && s !== '') {
+        ctrl = r2(saldoAnterior + (c === '' ? 0 : c) - (d === '' ? 0 : d));
+        dif  = r2(s - ctrl);
+        saldoAnterior = s;
+      }
+      return { ...row, orden: isSA ? '' : order++, debito: d, credito: c, saldo: s, control: ctrl, diferencia: dif };
     });
-    return{name:acc.title.slice(0,31),rows};
+    return { name: acc.title.slice(0, 31), rows };
   });
-  return{sheets,meta:{}};
+
+  return { sheets, meta: {} };
 }
 
 // ── HSBC ─────────────────────────────────────────────────────
 async function parseHSBC(pdf, rules) {
-  const text = await getPdfText(pdf);
-  const yearM=text.match(/EXTRACTO\s+DEL\s+\d{2}\/\d{2}\/(\d{4})/i);
-  const year=yearM?yearM[1]:String(new Date().getFullYear());
-  const MON3={ENE:0,FEB:1,MAR:2,ABR:3,MAY:4,JUN:5,JUL:6,AGO:7,SEP:8,OCT:9,NOV:10,DIC:11,
-    ENERO:0,FEBRERO:1,MARZO:2,ABRIL:3,MAYO:4,JUNIO:5,JULIO:6,AGOSTO:7,SEPTIEMBRE:8,OCTUBRE:9,NOVIEMBRE:10,DICIEMBRE:11};
+  // Fixed parser — mirrors the standalone HSBC converter that works correctly.
+  // Key fixes vs broken version:
+  //   1. matchAccountTitle looks for "CUENTA CORRIENTE EN $ NRO." pattern (not account-number-first)
+  //   2. amtToNum handles HSBC format: comma=thousands dot=decimal (e.g. 5,931,636.87)
+  //      as well as Argentine format 5.931.636,87
+  //   3. Summary row parsing to get saldo anterior/actual
+  //   4. Proper "DETALLE DE OPERACIONES" trigger for detailActive
 
-  function cleanLine(l){return(l||'').replace(/\s+/g,' ').normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();}
-  function amtToNum(r){
-    let t=String(r||'').trim().replace(/\./g,'').replace(',','.');
-    const n=parseFloat(t);return Number.isFinite(n)?n:null;
+  function cleanLn(l) {
+    return (l || '')
+      .replace(/HOJA\s+\d+\s+DE\s+\d+/ig, ' ')
+      .replace(/\b\d{6,}-P\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
-  function fmtDate(d,mon3,yr){
-    const mm=MON3[mon3.toUpperCase()];if(mm===undefined)return'';
-    return`${d.padStart(2,'0')}/${String(mm+1).padStart(2,'0')}/${yr.slice(-2)}`;
+
+  function amtH(raw) {
+    if (raw == null) return null;
+    let s = String(raw).trim();
+    if (!s) return null;
+    let neg = false;
+    if (/^-/.test(s)) { neg = true; s = s.replace(/^-+/, ''); }
+    if (/-$/.test(s)) { neg = true; s = s.replace(/-+$/, ''); }
+    if (/^\(.*\)$/.test(s)) { neg = true; s = s.slice(1, -1); }
+    s = s.replace(/[^0-9.,]/g, '');
+    if (!s) return null;
+    if (s.includes(',') && s.includes('.')) {
+      // whichever separator comes last is the decimal one
+      s = s.lastIndexOf('.') > s.lastIndexOf(',')
+        ? s.replace(/,/g, '')                        // 5,931,636.87
+        : s.replace(/\./g, '').replace(',', '.');    // 5.931.636,87
+    } else if (s.includes(',')) {
+      // comma only: decimal if exactly 2 digits after, else thousands
+      s = /,\d{2}$/.test(s) ? s.replace(',', '.') : s.replace(/,/g, '');
+    }
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? (neg ? -n : n) : null;
   }
-  function isAmtTok(t){return/^[0-9,.\-]+$/.test(t)&&/\d/.test(t);}
-  function matchAccTitle(line){
-    const m=line.match(/^(\d{3}-\d+-\d+[-/]\d*)\s+([\w\s]+?(?:PESOS|DOLARES|USD|ARS))/i);
-    if(m) return{numero:m[1].trim(),title:line.trim(),moneda:''};
+
+  const MON3 = { ENE:1,FEB:2,MAR:3,ABR:4,MAY:5,JUN:6,JUL:7,AGO:8,SEP:8,SET:9,OCT:10,NOV:11,DIC:12 };
+
+  function fmtDt(d, mon3, yr) {
+    const mm = MON3[String(mon3 || '').toUpperCase().slice(0, 3)];
+    if (!mm || !yr) return '';
+    return `${String(d).padStart(2,'0')}/${String(mm).padStart(2,'0')}/${String(yr).slice(-2)}`;
+  }
+
+  function isAmt(t) {
+    return /^[\(\)\-]?[0-9][0-9.,]*\-?$/.test(String(t || '')) && /\d/.test(t);
+  }
+
+  function isNoise(line) {
+    if (!line) return true;
+    if (/^FECHA\s+REFERENCIA\s+NRO\s+DEBITO/i.test(line)) return true;
+    if (/^PRODUCTO\s+SUC\s+CUENTA\s+CBU/i.test(line)) return true;
+    if (/^EXTRACTO\s+DEL/i.test(line)) return true;
+    if (/^CUENTA\s+CORRIENTE\s+EN?\s+\$/i.test(line)) return true;
+    if (/^CTA\.CTE\.ESPECIAL\s+(?:EN\s+)?U\$S/i.test(line)) return true;
+    if (/DETALLE\s+DE\s+OPERACIONES/i.test(line)) return true;
+    if (/^C\.U\.I\.T\./i.test(line)) return true;
+    if (/^ESTIMADOS/i.test(line)) return true;
+    if (/^INGRESOS\s+BRUTOS/i.test(line)) return true;
+    if (/^\.{1,}$/i.test(line)) return true;
+    return false;
+  }
+
+  function matchAccTitle(line) {
+    let m = line.match(/CUENTA\s+CORRIENTE\s+EN\s+\$\s+NRO\.?\s*([0-9\-]+)/i);
+    if (m) return { title: `CUENTA CORRIENTE EN $ NRO. ${m[1]}`, numero: m[1], moneda: '$' };
+    m = line.match(/CTA\.?CTE\.?ESPECIAL\s+(?:EN\s+)?U\$S\s+NRO\.?\s*([0-9\-]+)/i);
+    if (m) return { title: `CTA.CTE.ESPECIAL EN U$S NRO. ${m[1]}`, numero: m[1], moneda: 'U$S' };
     return null;
   }
 
-  const lines=text.split(/\r?\n/).map(cleanLine).filter(Boolean);
-  const accounts=[];let current=null,detailActive=false,lastDate='',stopAll=false;
-  const dateRe=/^(\d{2})-([A-ZÁÉÍÓÚÑ]{3,})\s+-\s+(.+)$/i;
-  const noDateRe=/^-\s+(.+)$/;
-
-  for(const rawLine of lines){
-    if(stopAll) break;
-    const line=cleanLine(rawLine);if(!line) continue;
-    if(/^(DETALLE\s+DE\s+IMPUESTOS|REGIMEN\s+DE\s+GARANTIAS|FONDOS\s+COMUNES)/i.test(line)){stopAll=true;break;}
-    const accInfo=matchAccTitle(line);
-    if(accInfo){current={title:accInfo.title,rows:[],saldoInicial:null};accounts.push(current);detailActive=false;lastDate='';continue;}
-    if(/DETALLE\s+DE\s+OPERACIONES/i.test(line)){if(!current){current={title:'CUENTA HSBC',rows:[],saldoInicial:null};accounts.push(current);}detailActive=true;continue;}
-    if(!current) continue;
-    if(/NO\s+HUBO\s+NINGUNA\s+ACTIVIDAD/i.test(line)){detailActive=false;continue;}
-    const sfM=line.match(/-\s*SALDO\s+FINAL\s+([0-9.,\-]+)/i);if(sfM){detailActive=false;continue;}
-    const siM=line.match(/-\s*SALDO\s+ANTERIOR\s+([0-9.,\-]+)/i);if(siM){current.saldoInicial=amtToNum(siM[1]);continue;}
-    if(!detailActive) continue;
-    if(/^(FECHA\b|^-{5,})/i.test(line)) continue;
-    let rest=null,fecha='';
-    const md=line.match(dateRe);
-    if(md){fecha=fmtDate(md[1],md[2],year);if(fecha)lastDate=fecha;rest=md[3];}
-    else{const mn=line.match(noDateRe);if(mn){fecha=lastDate;rest=mn[1];}else{if(current.rows.length)current.rows[current.rows.length-1].descripcion+=' '+line;continue;}}
-    if(!rest) continue;
-    const tokens=rest.split(' ').filter(Boolean);
-    let saldoTok=null;for(let k=tokens.length-1;k>=0;k--){if(isAmtTok(tokens[k])){saldoTok=tokens[k];break;}}
-    if(!saldoTok) continue;
-    const sn=amtToNum(saldoTok);if(sn==null) continue;
-    const sIdx=tokens.lastIndexOf(saldoTok);const before=tokens.slice(0,sIdx);
-    let refIdx=before.findIndex(t=>/^\d{5}$/.test(t));if(refIdx===-1)refIdx=before.findIndex(t=>/^\d{4,6}$/.test(t));
-    if(refIdx===-1) continue;
-    const desc=before.slice(0,refIdx).join(' ').trim();
-    const amtToks=before.slice(refIdx+1).filter(isAmtTok);
-    let credito='',debito='';
-    if(amtToks.length>=2){debito=amtToks[0];credito=amtToks[1];}
-    else if(amtToks.length===1){const a=amtToks[0];const aN=amtToNum(a)||0;if(current.rows.length>0){const prevS=current.rows[current.rows.length-1].saldo;if(sn<prevS)debito=a;else credito=a;}else credito=a;}
-    else continue;
-    const cn=amtToNum(credito)||0,dn=amtToNum(debito)||0;
-    current.rows.push({orden:current.rows.length+1,fecha,mes:toMes(fecha),descripcion:desc,imputacion:classify(desc,rules),origen:'',credito:cn||'',debito:dn||'',saldo:sn,control:0,diferencia:0});
+  function parseSummaries(lines) {
+    const map = new Map();
+    for (const line of lines) {
+      // "CUENTA CORRIENTE $ CBLLT 0423-30519-5 1500050300004233051950 376,856.96 5,931,636.87"
+      if (!/^(CUENTA\s+CORRIENTE\s+\$|CTA\.CTE\.ESPECIAL)/i.test(line)) continue;
+      const parts = line.split(' ').filter(Boolean);
+      const acctTok = parts.find(p => /^\d{3,4}-\d{3,}-\d+$/.test(p));
+      if (!acctTok) continue;
+      const amts = parts.filter(isAmt);
+      if (amts.length < 2) continue;
+      map.set(acctTok, {
+        saldoInicial: amtH(amts[amts.length - 2]),
+        saldoFinal:   amtH(amts[amts.length - 1])
+      });
+    }
+    return map;
   }
-  accounts.forEach(acc=>addControl(acc.rows));
-  const sheets=accounts.filter(a=>a.rows.length>0).map(a=>({name:a.title.slice(0,31),rows:a.rows}));
-  const meta={};if(accounts.length&&accounts[0].saldoInicial!=null)meta.saldoAnterior=accounts[0].saldoInicial;
-  return{sheets,meta};
+
+  // ── Extract text preserving rows via Y coordinates ──
+  const pageLines = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const yTol = 2.0;
+    const rows = [];
+    for (const it of content.items) {
+      if (!it || it.str == null || !String(it.str).trim()) continue;
+      const item = { s: String(it.str), x: it.transform[4], y: it.transform[5] };
+      let row = rows.find(r => Math.abs(r.y - item.y) <= yTol);
+      if (!row) { row = { y: item.y, cells: [] }; rows.push(row); }
+      row.cells.push(item);
+    }
+    rows.sort((a, b) => b.y - a.y);
+    for (const row of rows) {
+      row.cells.sort((a, b) => a.x - b.x);
+      pageLines.push(cleanLn(row.cells.map(c => c.s).join(' ')));
+    }
+    pageLines.push('');
+  }
+
+  const fullText = pageLines.join('\n');
+  const yearM = fullText.match(/EXTRACTO\s+DEL\s+\d{2}\/\d{2}\/(\d{4})/i);
+  const year  = yearM ? yearM[1] : String(new Date().getFullYear());
+
+  const lines = fullText.split(/\r?\n/).map(cleanLn).filter(Boolean);
+  const summaryMap = parseSummaries(lines);
+
+  const accounts = [];
+  let current = null, detailActive = false, lastDate = '', stopAll = false;
+  const dateRe  = /^(\d{2})-([A-ZÁÉÍÓÚÑ]{3,4})\s+-\s+(.+)$/i;
+  const noDateRe = /^-\s+(.+)$/;
+
+  for (const rawLine of lines) {
+    if (stopAll) break;
+    const line = cleanLn(rawLine);
+    if (!line) continue;
+
+    if (/^(DETALLE\s+DE\s+IMPUESTOS|REGIMEN\s+DE\s+GARANTIAS|FONDOS\s+COMUNES\s+DE\s+INVERSION)/i.test(line)) {
+      stopAll = true; break;
+    }
+
+    const accInfo = matchAccTitle(line);
+    if (accInfo) {
+      const s = summaryMap.get(accInfo.numero) || {};
+      current = { title: accInfo.title, numero: accInfo.numero, moneda: accInfo.moneda,
+                  saldoInicial: s.saldoInicial ?? null, saldoFinal: s.saldoFinal ?? null, rows: [] };
+      accounts.push(current);
+      detailActive = false; lastDate = '';
+      continue;
+    }
+
+    if (/DETALLE\s+DE\s+OPERACIONES/i.test(line)) {
+      if (!current) {
+        current = { title: 'CUENTA HSBC', numero: '', moneda: '', saldoInicial: null, saldoFinal: null, rows: [] };
+        accounts.push(current);
+      }
+      detailActive = true; continue;
+    }
+
+    if (!current) continue;
+    if (/NO\s+HUBO\s+NINGUNA\s+ACTIVIDAD/i.test(line)) { detailActive = false; continue; }
+
+    const sfM = line.match(/-\s*SALDO\s+FINAL\s+([0-9.,\-]+)/i);
+    if (sfM) { const sf = amtH(sfM[1]); if (sf != null) current.saldoFinal = sf; detailActive = false; continue; }
+
+    const siM = line.match(/-\s*SALDO\s+ANTERIOR\s+([0-9.,\-]+)/i);
+    if (siM) { const si = amtH(siM[1]); if (si != null && current.saldoInicial == null) current.saldoInicial = si; continue; }
+
+    if (!detailActive) continue;
+    if (isNoise(line)) continue;
+
+    let fecha = '', rest = null;
+    const md = line.match(dateRe);
+    if (md) {
+      fecha = fmtDt(md[1], md[2], year);
+      if (fecha) lastDate = fecha;
+      rest = md[3];
+    } else {
+      const mn = line.match(noDateRe);
+      if (mn) { fecha = lastDate; rest = mn[1]; }
+      else { if (current.rows.length) current.rows[current.rows.length - 1].descripcion += ' ' + line; continue; }
+    }
+    if (!rest) continue;
+
+    // Strip trailing section keywords
+    for (const re of [/\s+SALDO\s+FINAL\b/i, /\s+RESUMEN\s+DE\s+ACUERDOS\b/i,
+                       /\s+CALCULO\s+DE\s+INTERESES\b/i, /\s+DETALLE\s+DE\s+IMPUESTOS\b/i,
+                       /\s+DETALLE\s+DE\s+PLAZOS\b/i]) {
+      const pos = rest.search(re);
+      if (pos >= 0) rest = rest.slice(0, pos).trim();
+    }
+
+    const tokens = rest.split(' ').filter(Boolean);
+    if (!tokens.length) continue;
+
+    // Rightmost amount token = saldo
+    let saldoIdx = -1;
+    for (let i = tokens.length - 1; i >= 0; i--) { if (isAmt(tokens[i])) { saldoIdx = i; break; } }
+    if (saldoIdx < 0) { if (current.rows.length) current.rows[current.rows.length - 1].descripcion += ' ' + line; continue; }
+
+    const saldoNum = amtH(tokens[saldoIdx]);
+    if (saldoNum == null) { if (current.rows.length) current.rows[current.rows.length - 1].descripcion += ' ' + line; continue; }
+
+    const beforeSaldo = tokens.slice(0, saldoIdx);
+
+    // NRO token: 4-6 digits
+    let refIdx = beforeSaldo.findIndex(t => /^\d{5}$/.test(t));
+    if (refIdx < 0) refIdx = beforeSaldo.findIndex(t => /^\d{4,6}$/.test(t));
+    if (refIdx < 0) { if (current.rows.length) current.rows[current.rows.length - 1].descripcion += ' ' + line; continue; }
+
+    const descBase  = beforeSaldo.slice(0, refIdx).join(' ').trim();
+    const nro       = beforeSaldo[refIdx];
+    const amtTokens = beforeSaldo.slice(refIdx + 1).filter(isAmt);
+    if (!amtTokens.length || !descBase) { if (current.rows.length) current.rows[current.rows.length - 1].descripcion += ' ' + line; continue; }
+
+    let debito = 0, credito = 0;
+    if (amtTokens.length >= 2) {
+      debito  = amtH(amtTokens[0]) || 0;
+      credito = amtH(amtTokens[1]) || 0;
+    } else {
+      const amt = amtH(amtTokens[0]) || 0;
+      const prevS = current.rows.length ? current.rows[current.rows.length - 1].saldo : current.saldoInicial;
+      if (prevS != null) { if (saldoNum < prevS) debito = amt; else credito = amt; }
+      else credito = amt;
+    }
+
+    current.rows.push({
+      orden:      current.rows.length + 1,
+      fecha,
+      mes:        toMes(fecha),
+      descripcion: `${descBase} (Ref: ${nro})`,
+      imputacion: classify(descBase, rules),
+      origen:     '',
+      credito:    credito || '',
+      debito:     debito  || '',
+      saldo:      saldoNum,
+      control:    0,
+      diferencia: 0
+    });
+  }
+
+  // addControl with saldoInicial as base
+  accounts.forEach(acc => {
+    const base = acc.saldoInicial;
+    let prev = base;
+    acc.rows.forEach((r, i) => {
+      const s = r2(parseArNum(r.saldo) ?? 0);
+      const c = r2(parseArNum(r.credito) ?? 0);
+      const d = r2(parseArNum(r.debito)  ?? 0);
+      const ctrl = (i === 0 && base != null) ? r2(base + c - d) : r2((prev ?? s) + c - d);
+      r.control    = ctrl;
+      r.diferencia = r2(s - ctrl);
+      prev = ctrl;
+    });
+  });
+
+  const sheets = accounts
+    .filter(a => a.rows.length > 0)
+    .map(a => ({ name: a.title.slice(0, 31), rows: a.rows }));
+  const meta = {};
+  if (accounts.length && accounts[0].saldoInicial != null) meta.saldoAnterior = accounts[0].saldoInicial;
+  return { sheets, meta };
 }
 
 // ── SANTANDER SELECT ─────────────────────────────────────────
@@ -1230,76 +1624,175 @@ async function parseSantanderSelect(pdf, rules) {
 
 // ── SANTANDER PERSONAL ───────────────────────────────────────
 async function parseSantanderPersonal(pdf, rules) {
-  const lines = await getPdfLines(pdf);
-  const RE_DATE=/^(\d{2}\/\d{2}\/\d{2})/;
-  const RE_ARS=/-?[\d.]+,\d{2}/g;
+  // Uses the same approach as the original working Santander converter:
+  // 1. Find the header row ("Fecha","Comprobante","Movimiento","Débito","Crédito","Saldo en cuenta")
+  // 2. Use those X positions to define column boundaries dynamically
+  // 3. Each data row is classified by which column boundary its X falls in
 
-  function parseAmtSP(token){
-    let t=String(token||'').trim().replace(/\s/g,'').replace(/^\-/,'');
-    t=t.replace(/\$/g,'').replace(/U/g,'').replace(/S/g,'');
-    t=t.replace(/\./g,'').replace(',','.');
-    if(!t||!/\d/.test(t))return null;
-    const n=parseFloat(t);return Number.isFinite(n)?n:null;
+  const HEADER_KEYS = ["Fecha","Comprobante","Movimiento","Débito","Crédito","Saldo en cuenta"];
+
+  function toKey(s) {
+    return s.normalize("NFD").replace(/[\u0300-\u036f]/g,"").trim()
+      .split(/\s+/).map(w=>w[0].toUpperCase()+w.slice(1)).join("");
   }
 
-  function isNoiseSP(line){
-    const l=line.toLowerCase();
-    return/^fecha\s+comprobante\s+movimiento/i.test(l)||/^saldo\s+anterior/i.test(l)||/^\s*cuenta\s+/i.test(l)||/^total\b/i.test(l);
-  }
-
-  function parseSection(sectionLines, currency){
-    const rows=[],moneyRe=RE_ARS;
-    let currentDate=null,buffer=[];
-    function flush(){
-      if(!currentDate||!buffer.length)return;
-      const row=(currentDate+' '+buffer.join(' ')).replace(/\s+/g,' ').trim();
-      if(!row||!RE_DATE.test(row))return;
-      const m=row.match(RE_DATE);if(!m)return;
-      const fecha=m[1];
-      const tokens=row.match(moneyRe)||[];if(!tokens.length)return;
-      const vals=tokens.map(parseAmtSP);
-      const saldo=vals[vals.length-1];
-      const candidates=vals.slice(0,-1);
-      let importe=candidates.length>=1?candidates[0]:null;
-      if(importe==null)return;
-      const sn=saldo??0;
-      const credito=importe>0?importe:0,debito=importe<0?Math.abs(importe):0;
-      const rest=row.slice(m[0].length).trim();
-      const firstNumIdx=rest.search(/-?[\d.]+,\d{2}/);
-      const desc=firstNumIdx>0?rest.slice(0,firstNumIdx).trim():rest;
-      rows.push({orden:rows.length+1,fecha,mes:toMes(fecha),descripcion:desc,imputacion:classify(desc,rules),origen:'',credito:credito||'',debito:debito||'',saldo:sn,control:0,diferencia:0});
+  function groupLines(items, tol=0.5) {
+    const rows=[];
+    for(const it of items){
+      let placed=false;
+      for(const row of rows){
+        if(Math.abs(row.y-it.y)<=tol){row.items.push(it);placed=true;break;}
+      }
+      if(!placed) rows.push({y:it.y,items:[it]});
     }
-    for(const ln of sectionLines){
-      if(isNoiseSP(ln))continue;
-      const m=ln.match(RE_DATE);
-      if(m){flush();currentDate=m[1];buffer=[ln.slice(m[0].length).trim()]||[];}
-      else if(currentDate){buffer.push(ln);}
-    }
-    flush();
-    addControl(rows);
-    return rows;
+    return rows.sort((a,b)=>b.y-a.y);
   }
 
-  // Try to split pesos vs USD
-  const pesoStart=lines.findIndex(l=>/movimientos\s+en\s+pesos/i.test(l));
-  const usdStart=lines.findIndex(l=>/movimientos\s+en\s+d[oó]lares/i.test(l));
-  const sheets=[];
-  if(pesoStart!==-1){
-    const end=usdStart>pesoStart?usdStart:lines.length;
-    const r=parseSection(lines.slice(pesoStart+1,end),'ARS');
-    if(r.length)sheets.push({name:'Mov. Pesos',rows:r});
+  function toFloat(str) {
+    if(!str||typeof str!=='string') return null;
+    const neg=/^-/.test(str.trim());
+    const cleaned=str.replace(/[^0-9.,]/g,'').replace(/\./g,'').replace(',','.');
+    const n=parseFloat(cleaned);
+    return isNaN(n)?null:(neg?-n:n);
   }
-  if(usdStart!==-1){
-    const r=parseSection(lines.slice(usdStart+1),'USD');
-    if(r.length)sheets.push({name:'Mov. Dólares',rows:r});
+
+  function fmtDate(s) {
+    const p=s.split('/');
+    return p.length===3?`${p[0]}/${p[1]}/${p[2].length===4?p[2].slice(2):p[2]}`:s;
   }
-  if(!sheets.length){
-    const r=parseSection(lines,'ARS');
-    if(r.length)sheets.push({name:'Movimientos',rows:r});
+
+  // Collect all pages' text items
+  const pages = await getPdfPageItems(pdf);
+
+  // Group all rows from all pages, but process per-page to detect headers
+  const allRows = [];
+  let colBoundaries = null; // reuse across pages once found
+  let colDefs = null;
+
+  for(const pg of pages){
+    const items = pg.items.map(it=>({str:it.str, x:it.x, y:it.y}));
+    const lines = groupLines(items);
+
+    // Look for header line on this page
+    const hIdx = lines.findIndex(r=>{
+      const texts = r.items.map(i=>i.str.trim());
+      return HEADER_KEYS.every(h=>texts.includes(h));
+    });
+
+    if(hIdx>=0){
+      // Build column definitions from header X positions
+      colDefs = HEADER_KEYS.map(title=>{
+        const cell = lines[hIdx].items.find(i=>i.str.trim()===title);
+        return {key:toKey(title), x:cell.x};
+      }).sort((a,b)=>a.x-b.x);
+
+      colBoundaries = colDefs.map((col,i)=>({
+        key: col.key,
+        L: i===0 ? -Infinity : (colDefs[i-1].x+col.x)/2,
+        R: i===colDefs.length-1 ? Infinity : (col.x+colDefs[i+1].x)/2,
+      }));
+    }
+
+    // If no column definitions yet, skip this page
+    if(!colBoundaries) continue;
+
+    const dataStart = hIdx>=0 ? hIdx+1 : 0;
+
+    for(let i=dataStart; i<lines.length; i++){
+      const line = lines[i];
+
+      // Classify each item into a column
+      const cols = {};
+      for(const cb of colBoundaries) cols[cb.key]=[];
+      for(const it of line.items){
+        if(!it.str.trim()) continue;
+        for(const cb of colBoundaries){
+          if(it.x>=cb.L && it.x<cb.R){ cols[cb.key].push(it.str); break; }
+        }
+      }
+
+      const fechaP = cols['Fecha']||[];
+      const movP   = cols['Movimiento']||[];
+      const debP   = cols['Debito']||[];
+      const credP  = cols['Credito']||[];
+      const salP   = cols['SaldoEnCuenta']||[];
+
+      const hasDate = fechaP.length>0 && /^\d{2}\/\d{2}\/\d{2,4}$/.test(fechaP[0]);
+      const hasMov  = movP.length>0;
+      const hasSal  = salP.length>0;
+
+      // Continuation line (detail text, no date, no saldo) → append to last row desc
+      if(!hasDate && hasMov && !hasSal){
+        if(allRows.length) allRows[allRows.length-1].extraDesc += ' '+movP.join(' ');
+        continue;
+      }
+
+      // Must have a date to be a new row
+      if(!hasDate) continue;
+
+      const fecha = fmtDate(fechaP[0]);
+      const mov   = movP.join(' ').trim();
+      const deb   = debP[0]||'';
+      const cred  = credP[0]||'';
+      const sal   = salP[0]||'';
+
+      // Skip Saldo Inicial row (no deb/cred)
+      if(/Saldo Inicial/i.test(mov)){
+        allRows.push({fecha, desc:'Saldo Inicial', deb:'', cred:'', sal, extraDesc:'', isSaldoInicial:true});
+        continue;
+      }
+
+      allRows.push({fecha, desc:mov, deb, cred, sal, extraDesc:''});
+    }
   }
-  return{sheets,meta:{}};
+
+  // Build output rows
+  let prevSaldo=null;
+  const rows=[];
+
+  for(const r of allRows){
+    const desc=(r.desc+(r.extraDesc?' '+r.extraDesc:'')).trim();
+    const fecha=r.fecha;
+
+    if(r.isSaldoInicial){
+      const sn=toFloat(r.sal)??0;
+      prevSaldo=sn;
+      continue; // don't output saldo inicial as a row
+    }
+
+    const debVal  = toFloat(r.deb);
+    const credVal = toFloat(r.cred);
+    const salVal  = toFloat(r.sal);
+    const saldo   = salVal!=null ? Math.abs(salVal) : 0;
+
+    // Determine debito/credito
+    let credito='', debito='';
+    if(credVal!=null && credVal!==0) credito=Math.abs(credVal);
+    else if(debVal!=null && debVal!==0) debito=Math.abs(debVal);
+    else if(prevSaldo!=null && salVal!=null){
+      const diff=(salVal<0?-Math.abs(salVal):salVal)-prevSaldo;
+      if(diff>0) credito=r2(diff);
+      else if(diff<0) debito=r2(Math.abs(diff));
+    }
+
+    prevSaldo=salVal!=null?(salVal<0?-Math.abs(salVal):salVal):prevSaldo;
+
+    rows.push({
+      orden:rows.length+1,
+      fecha, mes:toMes(fecha),
+      descripcion:desc,
+      imputacion:classify(desc,rules),
+      origen:'',
+      credito: credito||'',
+      debito:  debito||'',
+      saldo,
+      control:0, diferencia:0
+    });
+  }
+
+  addControl(rows);
+  return {sheets:[{name:'Movimientos',rows}], meta:{}};
 }
-
 // ── CREDICOOP ────────────────────────────────────────────────
 async function parseCredicoop(pdf, rules) {
   const pages = await getPdfPageItems(pdf);
