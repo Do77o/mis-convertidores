@@ -106,7 +106,7 @@ small{color:var(--muted);font-size:12px}
   <button class="bank-btn" onclick="selectBank('bbva')" id="btn-bbva"><span class="emoji">🔵</span><span>BBVA</span></button>
   <button class="bank-btn" onclick="selectBank('hsbc')" id="btn-hsbc"><span class="emoji">🔴</span><span>HSBC</span></button>
   <button class="bank-btn" onclick="selectBank('santander_select')" id="btn-santander_select"><span class="emoji">🔴</span><span>Santander Select</span></button>
-  <button class="bank-btn" onclick="selectBank('santander_personal')" id="btn-santander_personal"><span class="emoji">🔴</span><span>Santander Personal</span></button>
+  <button class="bank-btn" onclick="selectBank('santander_personal')" id="btn-santander_personal"><span class="emoji">🔴</span><span>Santander Empresa</span></button>
   <button class="bank-btn" onclick="selectBank('credicoop')" id="btn-credicoop"><span class="emoji">🟣</span><span>Credicoop</span></button>
   <button class="bank-btn" onclick="selectBank('supervielle')" id="btn-supervielle"><span class="emoji">🟢</span><span>Supervielle</span></button>
   <button class="bank-btn" onclick="selectBank('mp')" id="btn-mp"><span class="emoji">🔵</span><span>Mercado Pago</span></button>
@@ -127,7 +127,7 @@ small{color:var(--muted);font-size:12px}
       <div class="bank-card" onclick="selectBank('bbva')"><span class="emoji">🔵</span><div class="name">BBVA</div></div>
       <div class="bank-card" onclick="selectBank('hsbc')"><span class="emoji">🔴</span><div class="name">HSBC</div></div>
       <div class="bank-card" onclick="selectBank('santander_select')"><span class="emoji">🔴</span><div class="name">Santander Select</div></div>
-      <div class="bank-card" onclick="selectBank('santander_personal')"><span class="emoji">🔴</span><div class="name">Santander Personal</div></div>
+      <div class="bank-card" onclick="selectBank('santander_personal')"><span class="emoji">🔴</span><div class="name">Santander Empresa</div></div>
       <div class="bank-card" onclick="selectBank('credicoop')"><span class="emoji">🟣</span><div class="name">Credicoop</div></div>
       <div class="bank-card" onclick="selectBank('supervielle')"><span class="emoji">🟢</span><div class="name">Supervielle</div></div>
       <div class="bank-card" onclick="selectBank('mp')"><span class="emoji">🔵</span><div class="name">Mercado Pago</div></div>
@@ -225,7 +225,7 @@ const BANKS = {
   bbva:                { name: 'BBVA',                  desc: 'Movimientos en cuentas (múltiples cuentas por extracto).' },
   hsbc:                { name: 'HSBC',                  desc: 'Extracto de cuenta corriente y caja de ahorro.' },
   santander_select:    { name: 'Santander Select',     desc: 'Extracto completo con pesos, dólares, tarjeta de crédito y débito.' },
-  santander_personal:  { name: 'Santander Personal',   desc: 'Cuenta corriente / caja de ahorro (sin tarjetas).' },
+  santander_personal:  { name: 'Santander Empresa', desc: 'Cuenta corriente / caja de ahorro (sin tarjetas).' },
   credicoop:           { name: 'Credicoop',             desc: 'Cuenta Corriente Comercial y Banca Internet.' },
   supervielle:         { name: 'Supervielle',           desc: 'Extracto de cuenta corriente.' },
   mp:                  { name: 'Mercado Pago',          desc: 'Detalle de movimientos de cuenta.' },
@@ -1687,7 +1687,7 @@ async function parseSantanderPersonal(pdf, rules) {
 
   for(let i=0; i<allPageLines.length; i++){
     const t = allPageLines[i].text;
-    if(/^movimientos en pesos/i.test(t) || /^movimientos en d[oó]lares/i.test(t)){
+    if(/^movimientos en pesos\b/i.test(t) || /^movimientos en d[oó]lares\b/i.test(t)){
       // Find the next table header (within the next 10 lines)
       let cb = null;
       for(let j=i+1; j<Math.min(i+10, allPageLines.length); j++){
@@ -1703,15 +1703,15 @@ async function parseSantanderPersonal(pdf, rules) {
             L: k===0 ? -Infinity : (sorted[k-1].x+col.x)/2,
             R: k===sorted.length-1 ? Infinity : (col.x+sorted[k+1].x)/2,
           }));
-          sections.push({label:t, startLineIdx:j+1, colBoundaries:cb});
+          sections.push({label:t, markerLineIdx:i, startLineIdx:j+1, colBoundaries:cb});
           break;
         }
       }
       // If no header found nearby, still mark section (will use previous cb)
       if(!cb && sections.length>0){
-        sections.push({label:t, startLineIdx:i+1, colBoundaries:sections[sections.length-1].colBoundaries});
+        sections.push({label:t, markerLineIdx:i, startLineIdx:i+1, colBoundaries:sections[sections.length-1].colBoundaries});
       } else if(!cb){
-        sections.push({label:t, startLineIdx:i+1, colBoundaries:null});
+        sections.push({label:t, markerLineIdx:i, startLineIdx:i+1, colBoundaries:null});
       }
     }
   }
@@ -1751,11 +1751,17 @@ async function parseSantanderPersonal(pdf, rules) {
 
       // Skip lines that are clearly page headers / footers / noise
       if(/^Cuenta Corriente\b.*CBU:/i.test(lineText)) continue;
+      if(/^Cuenta Corriente especial\b/i.test(lineText)) continue;
       if(/^\*?\s*Salvo error/i.test(lineText)) continue;
       if(/^Saldo total/i.test(lineText)) continue;
       if(/^Detalle impositivo/i.test(lineText)) continue;
       if(/^Cambio de comisiones/i.test(lineText)) continue;
       if(/^Legales$/i.test(lineText)) continue;
+      if(/^No ten[eé]s movimientos/i.test(lineText)) continue;
+      if(/^Ante la falta/i.test(lineText)) continue;
+      if(/^Llamanos al/i.test(lineText)) continue;
+      if(/^Recordá que/i.test(lineText)) continue;
+      if(/^\d+\s*-\s*\d+$/.test(lineText.trim())) continue; // page numbers like "7 - 12"
 
       // Skip table header rows (they repeat on every page)
       const texts = pl.items.map(it=>it.str.trim());
@@ -1827,12 +1833,25 @@ async function parseSantanderPersonal(pdf, rules) {
   }
 
   // ── Pass 4: build final stitched row list ──
+  // Pre-compute a stop index for the last section: the first "Saldo total" line
+  // that appears after the last section starts (marks real end of transaction data).
+  function findSaldoTotalAfter(fromIdx) {
+    for(let i=fromIdx; i<allPageLines.length; i++){
+      if(/^saldo total\b/i.test(allPageLines[i].text)) return i;
+    }
+    return allPageLines.length;
+  }
+
   const stitched = [];
   for(let si=0; si<sections.length; si++){
     const sec = sections[si];
-    // End = start of next section's marker line (a few lines before its startLineIdx)
-    // For the last section, end = end of all lines.
-    const endIdx = si+1 < sections.length ? sections[si+1].startLineIdx - 8 : allPageLines.length;
+    let endIdx;
+    if(si+1 < sections.length){
+      endIdx = sections[si+1].markerLineIdx;
+    } else {
+      // Last section: cut at "Saldo total" to avoid pulling in legal/footer pages
+      endIdx = findSaldoTotalAfter(sec.startLineIdx);
+    }
     const dataRows = parseSection(sec, endIdx);
 
     if(si > 0){
