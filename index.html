@@ -1222,7 +1222,7 @@ async function parseBBVA(pdf, rules, fileName) {
       origen: '',
       debito:  movTxt.includes('-') ? r2(Math.abs(amt)) : '',
       credito: movTxt.includes('-') ? '' : r2(Math.abs(amt)),
-      saldo: r2(Math.abs(saldo)),
+      saldo: r2(saldo),
       control: '',
       diferencia: ''
     };
@@ -1654,10 +1654,11 @@ async function parseSantanderPersonal(pdf, rules) {
 
   function toFloat(str) {
     if(!str||typeof str!=='string') return null;
-    const neg=/^-/.test(str.trim());
-    const cleaned=str.replace(/[^0-9.,]/g,'').replace(/\./g,'').replace(',','.');
-    const n=parseFloat(cleaned);
-    return isNaN(n)?null:(neg?-n:n);
+    const t = str.trim().replace(/\s/g,'');
+    const neg = t.startsWith('-') || t.startsWith('−');
+    const cleaned = t.replace(/[^0-9.,]/g,'').replace(/\./g,'').replace(',','.');
+    const n = parseFloat(cleaned);
+    return isNaN(n) ? null : (neg ? -n : n);
   }
 
   function fmtDate(s) {
@@ -1795,9 +1796,9 @@ async function parseSantanderPersonal(pdf, rules) {
 
       const fecha = fmtDate(fechaP[0]);
       const mov   = movP.join(' ').trim();
-      const deb   = debP[0]||'';
-      const cred  = credP[0]||'';
-      const sal   = salP[0]||'';
+      const deb   = debP.join('').trim();   // join: "-$" + "95.935,95" → "-$95.935,95"
+      const cred  = credP.join('').trim();
+      const sal   = salP.join('').trim();
 
       if(/Saldo Inicial/i.test(mov)){
         dataRows.push({fecha, desc:'Saldo Inicial', deb:'', cred:'', sal, extraDesc:'', isSaldoInicial:true});
@@ -1815,15 +1816,15 @@ async function parseSantanderPersonal(pdf, rules) {
       const desc=(r.desc+(r.extraDesc?' '+r.extraDesc:'')).trim();
       if(r.isSaldoInicial){ prevSaldo=toFloat(r.sal)??0; continue; }
       const debVal=toFloat(r.deb), credVal=toFloat(r.cred), salVal=toFloat(r.sal);
-      const saldo=salVal!=null?Math.abs(salVal):0;
+      const saldo=salVal!=null?salVal:0;  // preserve sign (negative = descubierto)
       let credito='', debito='';
-      if(credVal!=null && credVal!==0) credito=Math.abs(credVal);
-      else if(debVal!=null && debVal!==0) debito=Math.abs(debVal);
+      if(credVal!=null && credVal!==0) credito=Math.abs(credVal);  // PDF credito col is always positive
+      else if(debVal!=null && debVal!==0) debito=Math.abs(debVal); // PDF debito col is always positive
       else if(prevSaldo!=null && salVal!=null){
-        const diff=(salVal<0?-Math.abs(salVal):salVal)-prevSaldo;
+        const diff=salVal-prevSaldo;
         if(diff>0) credito=r2(diff); else if(diff<0) debito=r2(Math.abs(diff));
       }
-      prevSaldo=salVal!=null?(salVal<0?-Math.abs(salVal):salVal):prevSaldo;
+      prevSaldo=salVal!=null?salVal:prevSaldo;
       out.push({orden:orden++, fecha:r.fecha, mes:toMes(r.fecha),
         descripcion:desc, imputacion:classify(desc,rules), origen:'',
         credito:credito||'', debito:debito||'', saldo, control:0, diferencia:0});
