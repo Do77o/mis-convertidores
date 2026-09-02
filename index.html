@@ -620,7 +620,7 @@ function makeSheetXML(sheetData, hasMeta) {
 
   let rowsXML = '';
   sheetData.forEach((row, ri) => {
-    const isHdr = ri === HDR_ROW;
+    const isHdr = ri === HDR_ROW || row[0] === 'Orden';
     const isMeta = hasMeta && ri === 0;
     let cellsXML = '';
     row.forEach((cell, ci) => {
@@ -711,6 +711,7 @@ function buildExcel(sheets, meta) {
     rows.push(HDR);
     for(const r of sheet.rows){
       const toN=v=>(v!==''&&v!=null&&!isNaN(Number(v)))?Number(v):'';
+      if(r._isHdr){ rows.push([...HDR]); continue; }
       rows.push([r.orden||'',r.fecha||'',r.mes||'',r.descripcion||r.desc||'',r.imputacion||'',r.origen||'',toN(r.credito),toN(r.debito),toN(r.saldo),toN(r.control),toN(r.diferencia)]);
     }
     const name=(sheet.name||'Movimientos').slice(0,31);
@@ -1624,12 +1625,17 @@ async function parseSantanderSelect(pdf, rules) {
 
 // ── SANTANDER PERSONAL ───────────────────────────────────────
 async function parseSantanderPersonal(pdf, rules) {
-  // Uses the same approach as the original working Santander converter:
-  // 1. Find the header row ("Fecha","Comprobante","Movimiento","Débito","Crédito","Saldo en cuenta")
-  // 2. Use those X positions to define column boundaries dynamically
-  // 3. Each data row is classified by which column boundary its X falls in
+  // Approach:
+  // 1. Use "Movimientos en pesos" / "Movimientos en dólares" as section markers
+  //    (NOT the repeating table header, which appears on every page).
+  // 2. Within each section, use the X-position column boundaries from the first
+  //    header seen in that section to classify items into columns.
+  // 3. Output: one sheet. Between sections insert 2 blank rows + title row +
+  //    a repeated header row (Orden, Fecha, Mes...) so it looks like the image.
 
   const HEADER_KEYS = ["Fecha","Comprobante","Movimiento","Débito","Crédito","Saldo en cuenta"];
+  const BLANK_ROW = {orden:'',fecha:'',mes:'',descripcion:'',imputacion:'',origen:'',credito:'',debito:'',saldo:'',control:'',diferencia:''};
+  const HDR_ROW   = {_isHdr:true}; // buildExcel detects this and pushes the full HDR array with bold style
 
   function toKey(s) {
     return s.normalize("NFD").replace(/[\u0300-\u036f]/g,"").trim()
@@ -1637,15 +1643,13 @@ async function parseSantanderPersonal(pdf, rules) {
   }
 
   function groupLines(items, tol=0.5) {
-    const rows=[];
+    const map=[];
     for(const it of items){
-      let placed=false;
-      for(const row of rows){
-        if(Math.abs(row.y-it.y)<=tol){row.items.push(it);placed=true;break;}
-      }
-      if(!placed) rows.push({y:it.y,items:[it]});
+      let found=map.find(r=>Math.abs(r.y-it.y)<=tol);
+      if(found) found.items.push(it);
+      else map.push({y:it.y, items:[it]});
     }
-    return rows.sort((a,b)=>b.y-a.y);
+    return map.sort((a,b)=>b.y-a.y);
   }
 
   function toFloat(str) {
@@ -1661,54 +1665,108 @@ async function parseSantanderPersonal(pdf, rules) {
     return p.length===3?`${p[0]}/${p[1]}/${p[2].length===4?p[2].slice(2):p[2]}`:s;
   }
 
-  // Collect all pages' text items
   const pages = await getPdfPageItems(pdf);
 
-  // Group all rows from all pages, but process per-page to detect headers
-  const allRows = [];
-  let colBoundaries = null; // reuse across pages once found
-  let colDefs = null;
-
-  for(const pg of pages){
-    const items = pg.items.map(it=>({str:it.str, x:it.x, y:it.y}));
+  // ── Pass 1: collect all page lines with their page index ──
+  // We need to detect "Movimientos en pesos" / "Movimientos en dólares" as section
+  // boundaries, NOT the table header row (which repeats on every page).
+  const allPageLines = []; // [{pageIdx, lineIdx, text, items, y}]
+  for(let pi=0; pi<pages.length; pi++){
+    const items = pages[pi].items.map(it=>({str:it.str, x:it.x, y:it.y}));
     const lines = groupLines(items);
-
-    // Look for header line on this page
-    const hIdx = lines.findIndex(r=>{
-      const texts = r.items.map(i=>i.str.trim());
-      return HEADER_KEYS.every(h=>texts.includes(h));
-    });
-
-    if(hIdx>=0){
-      // Build column definitions from header X positions
-      colDefs = HEADER_KEYS.map(title=>{
-        const cell = lines[hIdx].items.find(i=>i.str.trim()===title);
-        return {key:toKey(title), x:cell.x};
-      }).sort((a,b)=>a.x-b.x);
-
-      colBoundaries = colDefs.map((col,i)=>({
-        key: col.key,
-        L: i===0 ? -Infinity : (colDefs[i-1].x+col.x)/2,
-        R: i===colDefs.length-1 ? Infinity : (col.x+colDefs[i+1].x)/2,
-      }));
+    for(let li=0; li<lines.length; li++){
+      const text = lines[li].items.sort((a,b)=>a.x-b.x).map(i=>i.str).join(' ').trim();
+      allPageLines.push({pageIdx:pi, lineIdx:li, text, items:lines[li].items, y:lines[li].y});
     }
+  }
 
-    // If no column definitions yet, skip this page
-    if(!colBoundaries) continue;
+  // ── Pass 2: find section boundaries ──
+  // A section starts at "Movimientos en pesos" or "Movimientos en dólares"
+  // The table header immediately follows (same page or next), giving column X-positions.
+  const sections = []; // [{label, startLineIdx, colBoundaries}]
 
-    const dataStart = hIdx>=0 ? hIdx+1 : 0;
-
-    for(let i=dataStart; i<lines.length; i++){
-      const line = lines[i];
-
-      // Classify each item into a column
-      const cols = {};
-      for(const cb of colBoundaries) cols[cb.key]=[];
-      for(const it of line.items){
-        if(!it.str.trim()) continue;
-        for(const cb of colBoundaries){
-          if(it.x>=cb.L && it.x<cb.R){ cols[cb.key].push(it.str); break; }
+  for(let i=0; i<allPageLines.length; i++){
+    const t = allPageLines[i].text;
+    if(/^movimientos en pesos/i.test(t) || /^movimientos en d[oó]lares/i.test(t)){
+      // Find the next table header (within the next 10 lines)
+      let cb = null;
+      for(let j=i+1; j<Math.min(i+10, allPageLines.length); j++){
+        const texts = allPageLines[j].items.map(it=>it.str.trim());
+        if(HEADER_KEYS.every(h=>texts.includes(h))){
+          // Build column boundaries from this header
+          const sorted = HEADER_KEYS.map(title=>{
+            const cell = allPageLines[j].items.find(it=>it.str.trim()===title);
+            return {key:toKey(title), x:cell.x};
+          }).sort((a,b)=>a.x-b.x);
+          cb = sorted.map((col,k)=>({
+            key: col.key,
+            L: k===0 ? -Infinity : (sorted[k-1].x+col.x)/2,
+            R: k===sorted.length-1 ? Infinity : (col.x+sorted[k+1].x)/2,
+          }));
+          sections.push({label:t, startLineIdx:j+1, colBoundaries:cb});
+          break;
         }
+      }
+      // If no header found nearby, still mark section (will use previous cb)
+      if(!cb && sections.length>0){
+        sections.push({label:t, startLineIdx:i+1, colBoundaries:sections[sections.length-1].colBoundaries});
+      } else if(!cb){
+        sections.push({label:t, startLineIdx:i+1, colBoundaries:null});
+      }
+    }
+  }
+
+  // If no "Movimientos en..." markers found, fall back to old single-section behavior
+  // using the first header found
+  if(sections.length===0){
+    let cb=null;
+    for(let i=0; i<allPageLines.length; i++){
+      const texts = allPageLines[i].items.map(it=>it.str.trim());
+      if(HEADER_KEYS.every(h=>texts.includes(h))){
+        const sorted=HEADER_KEYS.map(title=>{
+          const cell=allPageLines[i].items.find(it=>it.str.trim()===title);
+          return{key:toKey(title),x:cell.x};
+        }).sort((a,b)=>a.x-b.x);
+        cb=sorted.map((col,k)=>({
+          key:col.key,
+          L:k===0?-Infinity:(sorted[k-1].x+col.x)/2,
+          R:k===sorted.length-1?Infinity:(col.x+sorted[k+1].x)/2,
+        }));
+        sections.push({label:'Movimientos', startLineIdx:i+1, colBoundaries:cb});
+        break;
+      }
+    }
+  }
+
+  // ── Pass 3: parse data rows for each section ──
+  // Each section runs from its startLineIdx until the startLineIdx of the next section.
+  function parseSection(sec, endLineIdx) {
+    const cb = sec.colBoundaries;
+    if(!cb) return [];
+    const dataRows = [];
+
+    for(let i=sec.startLineIdx; i<endLineIdx; i++){
+      const pl = allPageLines[i];
+      const lineText = pl.text;
+
+      // Skip lines that are clearly page headers / footers / noise
+      if(/^Cuenta Corriente\b.*CBU:/i.test(lineText)) continue;
+      if(/^\*?\s*Salvo error/i.test(lineText)) continue;
+      if(/^Saldo total/i.test(lineText)) continue;
+      if(/^Detalle impositivo/i.test(lineText)) continue;
+      if(/^Cambio de comisiones/i.test(lineText)) continue;
+      if(/^Legales$/i.test(lineText)) continue;
+
+      // Skip table header rows (they repeat on every page)
+      const texts = pl.items.map(it=>it.str.trim());
+      if(HEADER_KEYS.every(h=>texts.includes(h))) continue;
+
+      // Classify items into columns
+      const cols={};
+      for(const c of cb) cols[c.key]=[];
+      for(const it of pl.items){
+        if(!it.str.trim()) continue;
+        for(const c of cb){ if(it.x>=c.L && it.x<c.R){ cols[c.key].push(it.str); break; } }
       }
 
       const fechaP = cols['Fecha']||[];
@@ -1721,13 +1779,12 @@ async function parseSantanderPersonal(pdf, rules) {
       const hasMov  = movP.length>0;
       const hasSal  = salP.length>0;
 
-      // Continuation line (detail text, no date, no saldo) → append to last row desc
+      // Continuation line (description detail, no date, no saldo)
       if(!hasDate && hasMov && !hasSal){
-        if(allRows.length) allRows[allRows.length-1].extraDesc += ' '+movP.join(' ');
+        const last = [...dataRows].reverse().find(r=>!r.isSaldoInicial);
+        if(last) last.extraDesc += ' '+movP.join(' ');
         continue;
       }
-
-      // Must have a date to be a new row
       if(!hasDate) continue;
 
       const fecha = fmtDate(fechaP[0]);
@@ -1736,62 +1793,61 @@ async function parseSantanderPersonal(pdf, rules) {
       const cred  = credP[0]||'';
       const sal   = salP[0]||'';
 
-      // Skip Saldo Inicial row (no deb/cred)
       if(/Saldo Inicial/i.test(mov)){
-        allRows.push({fecha, desc:'Saldo Inicial', deb:'', cred:'', sal, extraDesc:'', isSaldoInicial:true});
+        dataRows.push({fecha, desc:'Saldo Inicial', deb:'', cred:'', sal, extraDesc:'', isSaldoInicial:true});
         continue;
       }
-
-      allRows.push({fecha, desc:mov, deb, cred, sal, extraDesc:''});
+      dataRows.push({fecha, desc:mov, deb, cred, sal, extraDesc:''});
     }
+    return dataRows;
   }
 
-  // Build output rows
-  let prevSaldo=null;
-  const rows=[];
-
-  for(const r of allRows){
-    const desc=(r.desc+(r.extraDesc?' '+r.extraDesc:'')).trim();
-    const fecha=r.fecha;
-
-    if(r.isSaldoInicial){
-      const sn=toFloat(r.sal)??0;
-      prevSaldo=sn;
-      continue; // don't output saldo inicial as a row
+  function buildSectionRows(dataRows) {
+    let prevSaldo=null, orden=1;
+    const out=[];
+    for(const r of dataRows){
+      const desc=(r.desc+(r.extraDesc?' '+r.extraDesc:'')).trim();
+      if(r.isSaldoInicial){ prevSaldo=toFloat(r.sal)??0; continue; }
+      const debVal=toFloat(r.deb), credVal=toFloat(r.cred), salVal=toFloat(r.sal);
+      const saldo=salVal!=null?Math.abs(salVal):0;
+      let credito='', debito='';
+      if(credVal!=null && credVal!==0) credito=Math.abs(credVal);
+      else if(debVal!=null && debVal!==0) debito=Math.abs(debVal);
+      else if(prevSaldo!=null && salVal!=null){
+        const diff=(salVal<0?-Math.abs(salVal):salVal)-prevSaldo;
+        if(diff>0) credito=r2(diff); else if(diff<0) debito=r2(Math.abs(diff));
+      }
+      prevSaldo=salVal!=null?(salVal<0?-Math.abs(salVal):salVal):prevSaldo;
+      out.push({orden:orden++, fecha:r.fecha, mes:toMes(r.fecha),
+        descripcion:desc, imputacion:classify(desc,rules), origen:'',
+        credito:credito||'', debito:debito||'', saldo, control:0, diferencia:0});
     }
-
-    const debVal  = toFloat(r.deb);
-    const credVal = toFloat(r.cred);
-    const salVal  = toFloat(r.sal);
-    const saldo   = salVal!=null ? Math.abs(salVal) : 0;
-
-    // Determine debito/credito
-    let credito='', debito='';
-    if(credVal!=null && credVal!==0) credito=Math.abs(credVal);
-    else if(debVal!=null && debVal!==0) debito=Math.abs(debVal);
-    else if(prevSaldo!=null && salVal!=null){
-      const diff=(salVal<0?-Math.abs(salVal):salVal)-prevSaldo;
-      if(diff>0) credito=r2(diff);
-      else if(diff<0) debito=r2(Math.abs(diff));
-    }
-
-    prevSaldo=salVal!=null?(salVal<0?-Math.abs(salVal):salVal):prevSaldo;
-
-    rows.push({
-      orden:rows.length+1,
-      fecha, mes:toMes(fecha),
-      descripcion:desc,
-      imputacion:classify(desc,rules),
-      origen:'',
-      credito: credito||'',
-      debito:  debito||'',
-      saldo,
-      control:0, diferencia:0
-    });
+    addControl(out);
+    return out;
   }
 
-  addControl(rows);
-  return {sheets:[{name:'Movimientos',rows}], meta:{}};
+  // ── Pass 4: build final stitched row list ──
+  const stitched = [];
+  for(let si=0; si<sections.length; si++){
+    const sec = sections[si];
+    // End = start of next section's marker line (a few lines before its startLineIdx)
+    // For the last section, end = end of all lines.
+    const endIdx = si+1 < sections.length ? sections[si+1].startLineIdx - 8 : allPageLines.length;
+    const dataRows = parseSection(sec, endIdx);
+
+    if(si > 0){
+      // 2 blank rows, title row, header row
+      stitched.push({...BLANK_ROW});
+      stitched.push({...BLANK_ROW});
+      stitched.push({...BLANK_ROW, descripcion: sec.label});
+      stitched.push({...HDR_ROW});
+    }
+
+    const built = buildSectionRows(dataRows);
+    stitched.push(...built);
+  }
+
+  return {sheets:[{name:'Movimientos', rows:stitched}], meta:{}};
 }
 // ── CREDICOOP ────────────────────────────────────────────────
 async function parseCredicoop(pdf, rules) {
