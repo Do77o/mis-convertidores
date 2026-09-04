@@ -108,6 +108,7 @@ small{color:var(--muted);font-size:12px}
   <button class="bank-btn" onclick="selectBank('santander_select')" id="btn-santander_select"><span class="emoji">🔴</span><span>Santander Select</span></button>
   <button class="bank-btn" onclick="selectBank('santander_personal')" id="btn-santander_personal"><span class="emoji">🔴</span><span>Santander Empresa</span></button>
   <button class="bank-btn" onclick="selectBank('credicoop')" id="btn-credicoop"><span class="emoji">🟣</span><span>Credicoop</span></button>
+  <button class="bank-btn" onclick="selectBank('macro')" id="btn-macro"><span class="emoji">🔵</span><span>Macro</span></button>
   <button class="bank-btn" onclick="selectBank('supervielle')" id="btn-supervielle"><span class="emoji">🟢</span><span>Supervielle</span></button>
   <button class="bank-btn" onclick="selectBank('mp')" id="btn-mp"><span class="emoji">🔵</span><span>Mercado Pago</span></button>
   <div style="margin-top:auto;border-top:1px solid rgba(255,255,255,.1);padding-top:8px">
@@ -129,6 +130,7 @@ small{color:var(--muted);font-size:12px}
       <div class="bank-card" onclick="selectBank('santander_select')"><span class="emoji">🔴</span><div class="name">Santander Select</div></div>
       <div class="bank-card" onclick="selectBank('santander_personal')"><span class="emoji">🔴</span><div class="name">Santander Empresa</div></div>
       <div class="bank-card" onclick="selectBank('credicoop')"><span class="emoji">🟣</span><div class="name">Credicoop</div></div>
+      <div class="bank-card" onclick="selectBank('macro')"><span class="emoji">🔵</span><div class="name">Macro</div></div>
       <div class="bank-card" onclick="selectBank('supervielle')"><span class="emoji">🟢</span><div class="name">Supervielle</div></div>
       <div class="bank-card" onclick="selectBank('mp')"><span class="emoji">🔵</span><div class="name">Mercado Pago</div></div>
     </div>
@@ -226,6 +228,7 @@ const BANKS = {
   hsbc:                { name: 'HSBC',                  desc: 'Extracto de cuenta corriente y caja de ahorro.' },
   santander_select:    { name: 'Santander Select',     desc: 'Extracto completo con pesos, dólares, tarjeta de crédito y débito.' },
   santander_personal:  { name: 'Santander Empresa', desc: 'Cuenta corriente / caja de ahorro (sin tarjetas).' },
+  macro:                { name: 'Macro',                  desc: 'Cuenta corriente bancaria (extracto de movimientos).' },
   credicoop:           { name: 'Credicoop',             desc: 'Cuenta Corriente Comercial y Banca Internet.' },
   supervielle:         { name: 'Supervielle',           desc: 'Extracto de cuenta corriente.' },
   mp:                  { name: 'Mercado Pago',          desc: 'Detalle de movimientos de cuenta.' },
@@ -771,6 +774,7 @@ async function processFile(file) {
       case 'hsbc':               result = await parseHSBC(pdf, rules); break;
       case 'santander_select':   result = await parseSantanderSelect(pdf, rules); break;
       case 'santander_personal': result = await parseSantanderPersonal(pdf, rules); break;
+      case 'macro':              result = await parseMacro(pdf, rules); break;
       case 'credicoop':          result = await parseCredicoop(pdf, rules); break;
       case 'supervielle':        result = await parseSupervielle(pdf, rules); break;
       case 'mp':                 result = await parseMP(pdf, rules); break;
@@ -2047,6 +2051,152 @@ async function parseMP(pdf, rules) {
   return{sheets:[{name:'Movimientos',rows}],meta:{}};
 }
 
+// ── MACRO ────────────────────────────────────────────────────
+async function parseMacro(pdf, rules) {
+  // PDF.js confirmed structure (from debug):
+  // - Each page has its own Y coordinate space (y resets per page)
+  // - FECHA+DESC combined in one item at x≈40: "DD/MM/YY DESCRIPCION"
+  // - REFERENCIA at x≈263 (sometimes "0", sometimes a number — skip it)
+  // - The single monetary amount (debit or credit) at x≈330-433 (varies)
+  // - SALDO at x≈498-510
+  // - DEB vs CRED cannot be distinguished by X alone — determine from saldo delta
+  // Strategy: process page by page to avoid Y collision, use saldo delta for deb/cred.
+
+  const MONTHS_M = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+  function toMesM(f) {
+    const p=f.split('/'); if(p.length<2) return '';
+    const m=parseInt(p[1],10);
+    return m>=1&&m<=12?`${MONTHS_M[m-1]}-${p[2]}`:'';
+  }
+
+  // X boundaries (confirmed from debug data):
+  // FECHA+DESC: x < 263
+  // REFERENCIA: 263 ≤ x < 330  → skip
+  // AMOUNT:     330 ≤ x < 490  (both debits and credits land here)
+  // SALDO:      x ≥ 490
+  const X_REF_START  = 263;
+  const X_AMT_START  = 330;
+  const X_SALDO_START= 490;
+
+  // Group items by Y within a page (tolerance 2pt)
+  function groupLines(items, tol=2) {
+    const map = [];
+    for (const it of items) {
+      let row = map.find(r => Math.abs(r.y - it.y) <= tol);
+      if (!row) { row={y:it.y, items:[]}; map.push(row); }
+      row.items.push(it);
+    }
+    return map.sort((a,b) => b.y - a.y); // descending Y = top-to-bottom
+  }
+
+  // Skip-line patterns
+  const SKIP = [
+    /^Sucursal\b/i, /^AVENIDA/i, /^Sr\(es\)/i, /^LABORATORIO/i,
+    /^AGUIRRE/i, /^CP:/i, /^CAPITAL FEDERAL/i, /^Cantidad Titulares/i,
+    /^Hoja Nro\./i, /^Saldos consolidados/i, /^Saldo Cuentas en/i,
+    /^Periodo del Extracto/i, /^TIPO CUENTA/i,
+    /^CUENTA CORRIENTE BANCARIA\b/i, /^Clave Bancaria Uniforme/i,
+    /^DETALLE DE MOVIMIENTO/i, /^SALDO FINAL AL DIA/i,
+    /^TOTAL COBRADO/i, /^D\. 409\/2018/i, /^ESTIMADO CLIENTE/i,
+    /^LE HABILITEN/i, /^IIBB C\.A\.B\.A\./i, /^_{5,}/,
+    /^FECHA\b.*DESCRIPCION/i, /^C\.U\.I\.T/i,
+    /^\(463\)/, /^\d+ VILLA CRESPO/,
+  ];
+
+  const allDataRows = []; // {fecha, desc, amtVal, salVal}
+  let saldoInicial = null;
+  const pages = await getPdfPageItems(pdf);
+
+  for (const pg of pages) {
+    const items = pg.items
+      .filter(it => it.str && it.str.trim())
+      .map(it => ({str: it.str.trim(), x: it.x, y: it.y}));
+
+    const lines = groupLines(items);
+
+    for (const line of lines) {
+      const sorted = [...line.items].sort((a,b) => a.x - b.x);
+      const leftItem = sorted[0];
+      if (!leftItem) continue;
+
+      // Skip noise lines
+      if (SKIP.some(re => re.test(leftItem.str))) continue;
+      const fullText = sorted.map(i=>i.str).join(' ');
+      if (SKIP.some(re => re.test(fullText.trim()))) continue;
+
+      // Saldo inicial
+      if (/SALDO ULTIMO EXTRACTO/i.test(leftItem.str)) {
+        const salItem = sorted.find(i => i.x >= X_SALDO_START);
+        if (salItem) saldoInicial = parseArNum(salItem.str);
+        continue;
+      }
+
+      // Data row: leftItem must start with DD/MM/YY
+      const dateMatch = leftItem.str.match(/^(\d{2}\/\d{2}\/\d{2})\s*(.*)/);
+      if (!dateMatch) continue;
+
+      const fecha = dateMatch[1];
+      const desc  = dateMatch[2].trim();
+
+      // Get amount (x: 330–489) and saldo (x ≥ 490)
+      // Skip referencia items (x: 263–329) — they are "0" or a ref number
+      let amtStr = '', salStr = '';
+      for (const it of sorted) {
+        if (it === leftItem) continue;
+        if (it.x < X_REF_START) continue;       // shouldn't happen
+        if (it.x < X_AMT_START) continue;       // referencia column — skip
+        if (it.x < X_SALDO_START) {
+          if (!amtStr) amtStr = it.str;          // first amount item = the movement
+        } else {
+          if (!salStr) salStr = it.str;          // saldo column
+        }
+      }
+
+      const amtVal = amtStr ? parseArNum(amtStr) : null;
+      const salVal = salStr ? parseArNum(salStr) : null;
+
+      if (salVal == null) continue;
+
+      allDataRows.push({fecha, desc, amtVal, salVal});
+    }
+  }
+
+  // Build output rows — determine deb/cred from saldo delta
+  const rows = [];
+  let prevSaldo = saldoInicial;
+  let orden = 1;
+
+  for (const r of allDataRows) {
+    const sal = r.salVal;
+    const amt = r.amtVal != null ? Math.abs(r.amtVal) : null;
+
+    let debOut = '', crOut = '';
+
+    if (amt != null) {
+      // Use saldo delta to determine direction
+      if (prevSaldo != null) {
+        const delta = r2(sal - prevSaldo);
+        if (delta >= 0) crOut = amt;
+        else            debOut = amt;
+      } else {
+        // No prevSaldo yet — guess from sign conventions or just put in debito
+        debOut = amt;
+      }
+    }
+
+    prevSaldo = sal;
+
+    rows.push({
+      orden: orden++, fecha: r.fecha, mes: toMesM(r.fecha),
+      descripcion: r.desc, imputacion: classify(r.desc, rules), origen: '',
+      credito: crOut, debito: debOut, saldo: sal,
+      control: 0, diferencia: 0,
+    });
+  }
+
+  addControl(rows);
+  return {sheets:[{name:'Movimientos',rows}], meta:{saldoAnterior: saldoInicial??''}};
+}
 </script>
 </body>
 </html>
