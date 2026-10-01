@@ -847,7 +847,7 @@ async function getPdfPageItems(pdf) {
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
     const content = await page.getTextContent();
-    pages.push({ items: content.items.map(it => ({ str: String(it.str||''), x: it.transform[4], y: it.transform[5] })).filter(it=>it.str.trim()) });
+    pages.push({ items: content.items.map(it => ({ str: String(it.str||''), x: it.transform[4], y: it.transform[5], w: it.width||0 })).filter(it=>it.str.trim()) });
   }
   return pages;
 }
@@ -1637,13 +1637,29 @@ async function parseSantanderPersonal(pdf, rules) {
   // 3. Output: one sheet. Between sections insert 2 blank rows + title row +
   //    a repeated header row (Orden, Fecha, Mes...) so it looks like the image.
 
-  const HEADER_KEYS = ["Fecha","Comprobante","Movimiento","Débito","Crédito","Saldo en cuenta"];
+  // Two known header formats for Santander Empresa PDFs:
+  // Format A (old): Fecha | Comprobante | Movimiento | Débito | Crédito | Saldo en cuenta
+  // Format B (new): FECHA | DESCRIPCION | REFERENCIA | DEBITOS | CREDITOS | SALDO
+  const HEADER_KEYS_A = ["Fecha","Comprobante","Movimiento","Débito","Crédito","Saldo en cuenta"];
+  const HEADER_KEYS_B = ["FECHA","DESCRIPCION","REFERENCIA","DEBITOS","CREDITOS","SALDO"];
+  const HEADER_KEYS_B_MIN = ["FECHA","DEBITOS","CREDITOS","SALDO"];
   const BLANK_ROW = {orden:'',fecha:'',mes:'',descripcion:'',imputacion:'',origen:'',credito:'',debito:'',saldo:'',control:'',diferencia:''};
-  const HDR_ROW   = {_isHdr:true}; // buildExcel detects this and pushes the full HDR array with bold style
+  const HDR_ROW   = {_isHdr:true};
 
   function toKey(s) {
     return s.normalize("NFD").replace(/[\u0300-\u036f]/g,"").trim()
       .split(/\s+/).map(w=>w[0].toUpperCase()+w.slice(1)).join("");
+  }
+
+  // Detect which header format a line uses; returns {fmt:'A'|'B', keys} or null
+  function detectHeaderFormat(items) {
+    const strs = items.map(it=>it.str.trim());
+    const nrm = s => s.normalize("NFD").replace(/[\u0300-\u036f]/g,"").toUpperCase();
+    const normed = strs.map(nrm);
+    if(HEADER_KEYS_A.every(h=>strs.includes(h))) return {fmt:'A', keys:HEADER_KEYS_A};
+    if(HEADER_KEYS_B.every(h=>normed.includes(nrm(h)))) return {fmt:'B', keys:HEADER_KEYS_B};
+    if(HEADER_KEYS_B_MIN.every(h=>normed.includes(nrm(h)))) return {fmt:'B', keys:HEADER_KEYS_B_MIN};
+    return null;
   }
 
   function groupLines(items, tol=0.5) {
@@ -1696,19 +1712,20 @@ async function parseSantanderPersonal(pdf, rules) {
       // Find the next table header (within the next 10 lines)
       let cb = null;
       for(let j=i+1; j<Math.min(i+10, allPageLines.length); j++){
-        const texts = allPageLines[j].items.map(it=>it.str.trim());
-        if(HEADER_KEYS.every(h=>texts.includes(h))){
+        const hfmt = detectHeaderFormat(allPageLines[j].items);
+        if(hfmt){
           // Build column boundaries from this header
-          const sorted = HEADER_KEYS.map(title=>{
-            const cell = allPageLines[j].items.find(it=>it.str.trim()===title);
-            return {key:toKey(title), x:cell.x};
+          const nrm = s => s.normalize("NFD").replace(/[̀-ͯ]/g,"").toUpperCase();
+          const sorted = hfmt.keys.map(title=>{
+            const cell = allPageLines[j].items.find(it=>nrm(it.str.trim())===nrm(title));
+            return {key:toKey(title), x:cell?cell.x:0, fmt:hfmt.fmt};
           }).sort((a,b)=>a.x-b.x);
           cb = sorted.map((col,k)=>({
-            key: col.key,
+            key: col.key, fmt: hfmt.fmt,
             L: k===0 ? -Infinity : (sorted[k-1].x+col.x)/2,
             R: k===sorted.length-1 ? Infinity : (col.x+sorted[k+1].x)/2,
           }));
-          sections.push({label:t, markerLineIdx:i, startLineIdx:j+1, colBoundaries:cb});
+          sections.push({label:t, markerLineIdx:i, startLineIdx:j+1, colBoundaries:cb, fmt:hfmt.fmt});
           break;
         }
       }
@@ -1726,18 +1743,19 @@ async function parseSantanderPersonal(pdf, rules) {
   if(sections.length===0){
     let cb=null;
     for(let i=0; i<allPageLines.length; i++){
-      const texts = allPageLines[i].items.map(it=>it.str.trim());
-      if(HEADER_KEYS.every(h=>texts.includes(h))){
-        const sorted=HEADER_KEYS.map(title=>{
-          const cell=allPageLines[i].items.find(it=>it.str.trim()===title);
-          return{key:toKey(title),x:cell.x};
+      const hfmt = detectHeaderFormat(allPageLines[i].items);
+      if(hfmt){
+        const nrm = s => s.normalize("NFD").replace(/[̀-ͯ]/g,"").toUpperCase();
+        const sorted=hfmt.keys.map(title=>{
+          const cell=allPageLines[i].items.find(it=>nrm(it.str.trim())===nrm(title));
+          return{key:toKey(title),x:cell?cell.x:0};
         }).sort((a,b)=>a.x-b.x);
         cb=sorted.map((col,k)=>({
-          key:col.key,
+          key:col.key, fmt:hfmt.fmt,
           L:k===0?-Infinity:(sorted[k-1].x+col.x)/2,
           R:k===sorted.length-1?Infinity:(col.x+sorted[k+1].x)/2,
         }));
-        sections.push({label:'Movimientos', startLineIdx:i+1, colBoundaries:cb});
+        sections.push({label:'Movimientos', startLineIdx:i+1, colBoundaries:cb, fmt:hfmt.fmt});
         break;
       }
     }
@@ -1767,19 +1785,94 @@ async function parseSantanderPersonal(pdf, rules) {
       if(/^Llamanos al/i.test(lineText)) continue;
       if(/^Recordá que/i.test(lineText)) continue;
       if(/^\d+\s*-\s*\d+$/.test(lineText.trim())) continue; // page numbers like "7 - 12"
+      // Format B: skip page header lines (repeated on each page of new Santander PDFs)
+      if(/^Sr\(es\):/i.test(lineText)) continue;
+      if(/^DETALLE DE MOVIMIENTO$/i.test(lineText)) continue;
+      if(/^Sucursal\b/i.test(lineText)) continue;
+      if(/^Saldo Cuentas en/i.test(lineText)) continue;
+      if(/^TIPO CUENTA\b/i.test(lineText)) continue;
+      if(/^CUENTA CORRIENTE BANCARIA\b/i.test(lineText)) continue;
+      if(/^Clave Bancaria Uniforme/i.test(lineText)) continue;
+      if(/^Hoja Nro\.:/i.test(lineText)) continue;
+      if(/^Saldos consolidados/i.test(lineText)) continue;
+      if(/^Periodo del Extracto/i.test(lineText)) continue;
+      if(/^Tasa Nom\.\s*Anual/i.test(lineText)) continue;
 
-      // Skip table header rows (they repeat on every page)
-      const texts = pl.items.map(it=>it.str.trim());
-      if(HEADER_KEYS.every(h=>texts.includes(h))) continue;
+      // Skip table header ader rows (they repeat on every page)
+      if(detectHeaderFormat(pl.items)) continue;
 
       // Classify items into columns
       const cols={};
       for(const c of cb) cols[c.key]=[];
+      const fmt = cb[0]&&cb[0].fmt ? cb[0].fmt : 'A';
       for(const it of pl.items){
         if(!it.str.trim()) continue;
         for(const c of cb){ if(it.x>=c.L && it.x<c.R){ cols[c.key].push(it.str); break; } }
       }
 
+      // Format B (new Santander Empresa): FECHA | DESCRIPCION | REFERENCIA | DEBITOS | CREDITOS | SALDO
+      // In format B, FECHA item contains "DD/MM/YY DESCRIPTION TEXT" combined
+      if(fmt==='B'){
+        // The leftmost column (Fecha) in format B contains date+desc combined (like Macro)
+        // OR date and description are separate items in the same x-zone
+        const fechaBP = cols['Fecha']||[];
+        const descBP  = cols['Descripcion']||[];
+        const debBP   = cols['Debitos']||[];
+        const credBP  = cols['Creditos']||[];
+        const salBP   = cols['Saldo']||[];
+
+        // In format B the leftmost items often have date in one item and desc in same col
+        // Extract date from fechaBP[0] (may be "DD/MM/YY" or "DD/MM/YY DESC...")
+        let rawDate = fechaBP.length>0 ? fechaBP[0] : '';
+        let rawDesc = '';
+        const dateMatch = rawDate.match(/^(\d{2}\/\d{2}\/\d{2,4})\s*(.*)/);
+        if(dateMatch){
+          rawDate = dateMatch[1];
+          rawDesc = dateMatch[2];
+        }
+        // Append any remaining fechaBP items + descBP items as description
+        const descExtra = [...fechaBP.slice(1), ...descBP].join(' ').trim();
+        if(descExtra) rawDesc = (rawDesc+' '+descExtra).trim();
+
+        const hasDate = /^\d{2}\/\d{2}\/\d{2,4}$/.test(rawDate);
+        const hasSal  = salBP.length>0;
+
+        if(!hasDate && rawDesc && !hasSal){
+          const last = [...dataRows].reverse().find(r=>!r.isSaldoInicial);
+          if(last) last.extraDesc += ' '+rawDesc;
+          continue;
+        }
+        if(!hasDate) continue;
+
+        const fecha = fmtDate(rawDate);
+        const mov   = rawDesc;
+        const deb   = debBP.join('').trim();
+        const cred  = credBP.join('').trim();
+        const sal   = salBP.join('').trim();
+
+        // Check for "SALDO ULTIMO EXTRACTO" type lines (initial balance)
+        if(/saldo/i.test(mov) && !deb && !cred && sal){
+          dataRows.push({fecha, desc:'Saldo Inicial', deb:'', cred:'', sal, extraDesc:'', isSaldoInicial:true});
+          continue;
+        }
+        dataRows.push({fecha, desc:mov||'(sin descripción)', deb, cred, sal, extraDesc:''});
+        continue;
+      }
+
+      // Format B: also catch "SALDO ULTIMO EXTRACTO" lines that have no date in FECHA col
+      // These appear as a long text item in the description area + value in SALDO col
+      // We handle them by checking ALL items on the line for a saldo-keyword pattern
+      if(fmt==='B'){
+        const allText = pl.items.map(it=>it.str).join(' ');
+        const allSalItems = pl.items.filter(it=>it.x>=(cb.find(c=>c.key==='Saldo')||{L:400}).L);
+        const salStr = allSalItems.map(it=>it.str).join('').trim();
+        if(/saldo[^a-z]*ultimo[^a-z]*extracto/i.test(allText) && salStr){
+          dataRows.push({fecha:'00/00/00', desc:'Saldo Inicial', deb:'', cred:'', sal:salStr, extraDesc:'', isSaldoInicial:true});
+          continue;
+        }
+      }
+
+      // Format A (old Santander Empresa/Select)
       const fechaP = cols['Fecha']||[];
       const movP   = cols['Movimiento']||[];
       const debP   = cols['Debito']||[];
@@ -1906,7 +1999,10 @@ async function parseCredicoop(pdf, rules) {
     return/^-?\d{1,3}(?:\.\d{3})*,\d{2}$/.test(t)||/^-?\d+(?:\.\d{2})$/.test(t)||/^-?\d+(?:,\d{2})$/.test(t);
   }
   function isSeparator(norm){
-    return/denominacion|debito automaticos|transferencias pesos|detalle de transferencias|impuesto ley 25413|percibido del|banco credicoop|continua en pagina|>>>>>>/.test(norm);
+    // These are section headers / footers / non-transaction lines to skip.
+    // Note: 'impuesto ley 25413' is intentionally NOT here — it appears in transaction descriptions.
+    // Note: 'percibido del' and 'debitos automaticos' use `break` (above) not `continue`.
+    return/^denominacion\b|detalle de transferencias|^banco credicoop|continua en pagina|>>>>>>|^mixtura\b|^r\.n\.p/.test(norm);
   }
   function isSaldoAlLine(norm){return/saldo\s+al\s+\d{2}\/\d{2}\/\d{2}/i.test(norm)&&!norm.includes('saldo anterior');}
 
@@ -1918,67 +2014,205 @@ async function parseCredicoop(pdf, rules) {
     return`${MONTHS_CC[mm-1]}-${yy}`;
   }
 
-  // Find column boundaries from header line
-  let colBounds=null;
-  const allItems=pages.flatMap(pg=>pg.items.map(it=>({str:it.str,x:it.x,y:it.y})));
-  const allGrouped=groupLinesCC(allItems,2);
+  // ── Credicoop: process PAGE BY PAGE (critical: avoids Y-collision between pages)
+  // Each page reuses Y coords 94-758, so merging all pages would mix rows from different pages.
+  //
+  // Column layout (from header at y≈273):
+  //   FECHA/COMBTE  x≈30-99     (left edge)
+  //   DESCRIPCION   x≈178-231
+  //   DEBITO        x≈363       (right-aligned amounts land here)
+  //   CREDITO       x≈458       (right-aligned amounts land here)
+  //   SALDO         x≈563       (right-aligned amounts land here)
+  //
+  // Key insight: many rows have DEBITO or CREDITO but NO SALDO.
+  // The saldo only appears when Credicoop prints it (after credits, after certain debits).
+  // For rows without a saldo, we infer it from prevSaldo ± amount.
 
-  // Try to find the header with "FECHA" "DESCRIPCION" "COMPROBANTE" "DEBITOS" "CREDITOS" "SALDO"
-  for(const row of allGrouped){
-    const flat=row.items.sort((a,b)=>a.x-b.x).map(i=>normText(i.str)).join(' ');
-    if(flat.includes('fecha')&&flat.includes('descripcion')&&(flat.includes('debitos')||flat.includes('credito'))){
-      // Build column x-positions
-      const hdrs=row.items.sort((a,b)=>a.x-b.x);
-      colBounds=hdrs.map(h=>({key:normText(h.str),x:h.x}));
-      break;
+  // Extract column X boundaries from a header line (letters are individual PDF chars)
+  function extractColBounds(lineItems) {
+    // Group spaced-apart single-char items into words (gap > 6pt = new word)
+    const sorted = lineItems.slice().sort((a,b) => a.x - b.x);
+    const words = []; let cur = null;
+    for(const it of sorted){
+      const s = it.str.trim(); if(!s) continue;
+      if(!cur || it.x - cur.endX > 6){
+        cur = {key: normText(s), x: it.x, endX: it.x + 5.3};
+        words.push(cur);
+      } else {
+        cur.key  += normText(s);
+        cur.endX  = it.x + 5.3;
+      }
     }
+    const debW  = words.find(w => /^deb/.test(w.key) && !/^desc/.test(w.key));
+    const credW = words.find(w => /^cred/.test(w.key));
+    const salW  = words.find(w => /^saldo/.test(w.key));
+    if(debW && credW && salW) return { xDeb: debW.x, xCred: credW.x, xSal: salW.x };
+    return null;
   }
 
-  const rows=[];let lastDate='';
-  for(const row of allGrouped){
-    const items=row.items.sort((a,b)=>a.x-b.x);
-    const flat=row.items.map(i=>String(i.str||'').trim()).filter(Boolean).join(' ');
-    const norm=normText(flat);
-    if(isSeparator(norm)) continue;
-    if(isSaldoAlLine(norm)) continue;
-    if(/^(fecha\b|descripcion\b|comprobante\b)/.test(norm)) continue;
+  let colBounds = null;   // updated whenever a header row is found
+  let prevSaldo = null;   // running saldo
+  const rows = []; let lastDate = '';
 
-    // Try to parse with colBounds first, fallback to token parsing
-    const tokens=flat.split(/\s+/).filter(Boolean);
-    const dateTok=tokens[0];
-    const isDate=/^\d{2}\/\d{2}\/\d{2}$/.test(dateTok)||/^\d{2}\/\d{2}\/\d{4}$/.test(dateTok);
+  for(const pg of pages){
+    const items = pg.items.map(it => ({str: it.str, x: it.x, y: it.y, w: it.w||0}));
 
-    if(!isDate&&!lastDate) continue;
-    const fecha=isDate?dateTok:lastDate;
-    if(isDate) lastDate=dateTok;
+    // Skip pure annex/letter pages that have no transactions at all.
+    // Pages with no date pattern like dd/mm/yy are pure letter pages.
+    const pageAllText = normText(items.map(i=>i.str).join(' '));
+    const hasTransactionDate = /\b\d{2}\/\d{2}\/\d{2}\b/.test(pageAllText);
+    if(!hasTransactionDate) continue;  // letter pages (pages 5-6)
+    // Pure annex pages: 'DEBITOS AUTOMATICOS' appears very early — meaning it's the
+    // first real content after the page header (no transaction rows precede it).
+    // We detect this by checking if the page has NO transaction-date lines BEFORE the
+    // 'debitos automaticos' text. Strategy: sort lines top→bottom (desc y in PDF.js),
+    // see if we encounter 'debitos automaticos' before seeing any dd/mm/yy date.
+    {
+      // Sort items top→bottom. In PDF.js, Y increases upward, so high Y = top of page.
+      const sortedByY = items.slice().sort((a,b)=>b.y-a.y);
+      let foundDebAut = false, foundDate = false;
+      // Build a sliding window of ~3 consecutive items to catch multi-item text
+      for(let i=0;i<sortedByY.length;i++){
+        const window = sortedByY.slice(i, i+4).map(it=>normText(it.str)).join(' ');
+        if(/debitos\s*automaticos/.test(window)){ foundDebAut = true; break; }
+        if(/^\d{2}\/\d{2}\/\d{2}$/.test(sortedByY[i].str.trim())){ foundDate = true; break; }
+      }
+      if(foundDebAut && !foundDate) continue; // pure annex page
+    }
 
-    // Find saldo = last numeric token
-    let saldoTok=null;
-    for(let k=tokens.length-1;k>=0;k--){if(looksLikeNum(tokens[k])){saldoTok=tokens[k];break;}}
-    if(!saldoTok) continue;
-    const sn=parseArNumCC(saldoTok);if(sn==null) continue;
+    const pageLines = groupLinesCC(items, 1.5); // tight tolerance - each row is ~8pt apart
 
-    const sIdx=tokens.lastIndexOf(saldoTok);
-    const before=tokens.slice(isDate?1:0,sIdx);
+    for(const row of pageLines){
+      const its = row.items.sort((a,b) => a.x - b.x);
+      const norm = normText(its.map(i => i.str).join(''));
+      // normSpaced: same but preserves spaces between items (for regex needing \s+)
+      const normSpaced = normText(its.map(i => i.str).join(' '));
 
-    // Find debit and credit (2 numeric tokens before saldo)
-    const numToks=before.filter(looksLikeNum);
-    let credito='',debito='';
-    if(numToks.length>=2){debito=numToks[numToks.length-2];credito=numToks[numToks.length-1];}
-    else if(numToks.length===1){
-      const a=numToks[0];const an=parseArNumCC(a)||0;
-      if(rows.length>0){const ps=rows[rows.length-1].saldo;if(sn<(ps||0))debito=a;else credito=a;}
-      else credito=a;
-    } else continue;
+      // ── skip noise lines ──
+      if(!norm.trim()) continue;
+      // Stop processing this page when annex/summary section starts
+      if(/^debitos?\s*automaticos/.test(normSpaced)) break;
+      if(/^transferencias\s+pesos/.test(normSpaced)) break;
+      if(isSeparator(normSpaced)) continue;
+      if(isSaldoAlLine(normSpaced)) continue;
+      if(/pagina\s*\d+\/\d+/.test(normSpaced)) continue;
+      if(/resumen:\s*\d+\s*del:/.test(normSpaced)) continue;
+      if(/^cuenta\s*corriente/.test(normSpaced)) continue;
+      if(/^>{3}/.test(norm)) continue;
+      if(/viene\s*de\s*pagina|continua\s*en\s*pagina/.test(normSpaced)) continue;
+      if(/^\s*cta\.\s*\d/.test(normSpaced)) continue;
+      if(/^del:\s*\d{2}\/\d{2}\/\d{4}\s+al:/.test(normSpaced)) continue;  // date-range header
+      if(/^debito directo\b.*cbu/.test(normSpaced)) continue;   // page header CBU line
+      if(/percibido\s+del/.test(normSpaced)) break;   // summary footer — stop processing this page
 
-    // Description: tokens before first numeric
-    const firstNumIdx=before.findIndex(looksLikeNum);
-    let desc=before.slice(0,firstNumIdx>=0?firstNumIdx:before.length).join(' ').trim();
-    if(!desc) continue;
+      // ── detect & update column boundaries from header row ──
+      const flat0 = normText(its.map(i=>i.str).join(''));
+      // Only treat as column header if it has 'fecha' AND 'saldo' but NOT 'originante' (transfer annex header)
+      if(flat0.includes('fecha') && flat0.includes('deb') && flat0.includes('saldo') && !flat0.includes('originante')){
+        const cb = extractColBounds(its);
+        if(cb) colBounds = cb;
+        continue; // header row itself has no data
+      }
 
-    const cn=parseArNumCC(credito)||0,dn=parseArNumCC(debito)||0;
-    const mes=toMesCC(fecha.length===8?fecha:`${fecha.slice(0,6)}${fecha.slice(-2)}`);
-    rows.push({orden:rows.length+1,fecha,mes,descripcion:desc,imputacion:classify(desc,rules),origen:'',credito:cn||'',debito:dn||'',saldo:sn,control:0,diferencia:0});
+      // Use colBounds or hard-coded fallback
+      const xDeb  = colBounds ? colBounds.xDeb  : 363;
+      const xCred = colBounds ? colBounds.xCred  : 458;
+      const xSal  = colBounds ? colBounds.xSal   : 563;
+      const bCred = (xDeb + xCred) / 2;   // midpoint DEB|CRED
+      const bSal  = (xCred + xSal) / 2;   // midpoint CRED|SAL
+
+      // ── classify items by X ──
+      // Numbers in Credicoop are right-aligned. Wide numbers (many digits) have their
+      // left edge further left than the column header. We classify by right edge (x+w)
+      // when the item looks like a number and its left edge is near the numeric zone.
+      const descItems=[], debItems=[], credItems=[], salItems=[];
+      for(const it of its){
+        const s = it.str.trim(); if(!s) continue;
+        // Use right edge for classification of number-like items near numeric columns
+        const isNum = /^\d[\d.,]*$/.test(s);
+        if     (it.x >= bSal)            salItems.push(s);
+        else if(it.x >= bCred)           credItems.push(s);
+        else if(it.x >= xDeb - 7)        debItems.push(s);
+        // Fallback: if it looks like a number and its right edge lands in debit zone
+        else if(isNum && it.w > 0 && (it.x + it.w) >= xDeb - 2)  debItems.push(s);
+        else                             descItems.push(s);
+      }
+
+      // ── extract date from first desc token ──
+      const d0 = descItems[0] || '';
+      const isDate = /^\d{2}\/\d{2}\/\d{2}(\d{2})?$/.test(d0);
+      const fecha  = isDate ? d0 : lastDate;
+      if(isDate) lastDate = d0;
+      if(!fecha) continue;  // no date context yet
+
+      // ── SALDO ANTERIOR line ──
+      const fullText = its.map(i=>i.str).join(' ');
+      if(/saldo\s+anterior/i.test(fullText)){
+        const sn = parseArNumCC(salItems.join('') || debItems.join('') || credItems.join(''));
+        if(sn != null) prevSaldo = sn;
+        continue;
+      }
+
+      // ── parse amounts by column ──
+      const salStr  = salItems.join('').trim();
+      const debStr  = debItems.join('').trim();
+      const credStr = credItems.join('').trim();
+
+      const dv = parseArNumCC(debStr);
+      const cv = parseArNumCC(credStr);
+      const sv = parseArNumCC(salStr);
+
+      // If no amount at all anywhere → continuation description line
+      if(dv == null && cv == null && sv == null){
+        const descParts = descItems.filter((t,i) => !(i===0 && isDate) && !(i===1 && /^\d{3,10}$/.test(t)));
+        if(descParts.length > 0 && rows.length > 0){
+          rows[rows.length-1].descripcion += ' ' + descParts.join(' ');
+        }
+        continue;
+      }
+
+      // Determine debit / credit
+      let debito='', credito='';
+      if(dv != null && dv !== 0) debito = debStr;
+      if(cv != null && cv !== 0) credito = credStr;
+
+      // Determine saldo: use printed value if available, else infer
+      let saldo;
+      if(sv != null){
+        saldo = sv;
+      } else if(prevSaldo != null){
+        const dn = parseArNumCC(debito)||0;
+        const cn = parseArNumCC(credito)||0;
+        saldo = r2(prevSaldo - dn + cn);
+      } else {
+        // Can't determine saldo yet — skip (shouldn't happen after SALDO ANTERIOR)
+        continue;
+      }
+
+      // If we have neither debit nor credit, infer from saldo delta
+      if(!debito && !credito && prevSaldo != null){
+        const delta = r2(saldo - prevSaldo);
+        if(delta > 0)      credito = delta.toFixed(2).replace('.',',');
+        else if(delta < 0) debito  = (-delta).toFixed(2).replace('.',',');
+      }
+
+      prevSaldo = saldo;
+
+      // Build description (skip date + comprobante number)
+      const descFilt = descItems.filter((t,i) => {
+        if(i===0 && isDate) return false;
+        if(i===1 && /^\d{3,10}$/.test(t)) return false;
+        return true;
+      });
+      const desc = descFilt.join(' ').trim();
+      if(!desc) continue;
+
+      const cn2 = parseArNumCC(credito)||0, dn2 = parseArNumCC(debito)||0;
+      const mes = toMesCC(fecha.length===8 ? fecha : `${fecha.slice(0,6)}${fecha.slice(-2)}`);
+      rows.push({orden:rows.length+1, fecha, mes, descripcion:desc,
+        imputacion:classify(desc,rules), origen:'',
+        credito:cn2||'', debito:dn2||'', saldo, control:0, diferencia:0});
+    }
   }
   addControl(rows);
   return{sheets:[{name:'Movimientos',rows}],meta:{}};
